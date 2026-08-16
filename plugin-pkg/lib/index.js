@@ -782,11 +782,15 @@ export default {
           // 会话路由：RPC 必须带 sessionId（Client 从 dock standardProps 注入）
           const sessionId = str('sessionId', '');
           const st = sessionId ? sessionState(sessionId) : null;
+          // 会话视角状态：仅当本会话绑定过专属标签（activeTabId != null）才算 running；
+          // 否则即使全局 bridge 在跑（其他会话在用），本会话窗口也应显示 stopped，
+          // 避免「没打开浏览器却弹出内嵌浏览器窗口」。
+          const viewState = (st && st.activeTabId != null) ? bridgeStatus : 'stopped';
           let out;
           switch (name) {
             case 'status':
               out = await bibSafe(async () => ({
-                state: bridgeStatus,
+                state: viewState,
                 url: st ? st.url : '',
                 title: st ? st.title : '',
                 hasFrame: st ? !!st.frame : false,
@@ -800,7 +804,7 @@ export default {
             case 'start':
               out = await bibSafe(async () => {
                 await ensureRunning();
-                return { ok: true, code: bridgeCode, state: bridgeStatus };
+                return { ok: true, code: bridgeCode, state: viewState };
               });
               break;
             case 'stop':
@@ -812,7 +816,7 @@ export default {
               break;
             case 'poll':
               out = {
-                state: bridgeStatus,
+                state: viewState,
                 seq: st ? st.lastSeq : -1,
                 data: st && st.frame ? st.frame.data : '',
                 width: st && st.frame ? st.frame.width : 0,
