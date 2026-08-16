@@ -71,6 +71,29 @@ window.__ModuleLoader__.load({
 
       const el = React.createElement;
 
+      // 错误边界：捕获 BibCard 渲染异常，避免整个 dock 崩溃（abdicated）
+      class BibErrorBoundary extends React.Component {
+        constructor(props) {
+          super(props);
+          this.state = { error: null };
+        }
+        static getDerivedStateFromError(error) {
+          return { error: String((error && error.message) || error) };
+        }
+        componentDidCatch(error, info) {
+          try { console.error('[dsh-bib] dock render error:', error, info); } catch { /* ignore */ }
+        }
+        render() {
+          if (this.state.error) {
+            return el('div', { className: 'dshbib-card', style: { padding: '8px 12px' } },
+              el('span', { className: 'dshbib-title' }, 'dsh-bib 渲染错误'),
+              el('div', { style: { fontSize: 11, color: 'var(--dsw-alias-state-error-primary)' } }, String(this.state.error)),
+            );
+          }
+          return this.props.children;
+        }
+      }
+
       function BibCard(props) {
         const [st, setSt] = React.useState({
           state: 'stopped', url: '', title: '', seq: -1, data: '',
@@ -156,7 +179,7 @@ window.__ModuleLoader__.load({
         }, []);
 
         React.useEffect(() => {
-          rpc('status', {}).then((r) => {
+          rpcRef.current('status', {}).then((r) => {
             if (r) setSt((prev) => Object.assign({}, prev, {
               tabs: r.tabs || [], activeTab: r.activeTab, code: r.code, lastError: r.lastError || '',
             }));
@@ -311,7 +334,7 @@ window.__ModuleLoader__.load({
               maxWidth: 'calc(var(--dsh-composer-card-max-width, 780px) - 4 * var(--dsh-composer-dock-inset, 8px))',
               margin: '0 auto',
             },
-          }, el(BibCard, { sessionId: sid }));
+          }, el(BibErrorBoundary, null, el(BibCard, { sessionId: sid })));
         },
       ));
     }
