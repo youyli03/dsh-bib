@@ -339,7 +339,19 @@ export default {
     }
 
     // ---------------- 工具注册（静态插件：defineTool + ctx.tools.register） ----------------
-    function registerTool(name, description, params, handler) {
+    // render：GUI 工具卡片的人类可读摘要；模型侧仍通过 execute 返回值拿到完整 JSON（含截图 base64）。
+    function shortText(s, n) {
+      s = String(s == null ? '' : s);
+      const m = n || 400;
+      return s.length > m ? s.slice(0, m) + '…' : s;
+    }
+    function errText(value) {
+      if (value && value.ok === false && value.error) {
+        return '✗ ' + (value.error.code ? value.error.code + ': ' : '') + (value.error.message || '');
+      }
+      return '✗ 操作失败';
+    }
+    function registerTool(name, description, params, handler, render) {
       const tool = defineTool({
         name,
         description,
@@ -347,7 +359,19 @@ export default {
         output: {
           schema: { type: 'object', additionalProperties: true },
           render(args, value) {
-            return [{ type: 'text', text: JSON.stringify(value) }];
+            let text;
+            if (!value || value.ok === false) {
+              text = errText(value);
+            } else if (render) {
+              try {
+                text = render(args, value);
+              } catch (e) {
+                text = '渲染摘要失败: ' + ((e && e.message) || e);
+              }
+            } else {
+              text = JSON.stringify(value && value.result !== undefined ? value.result : value);
+            }
+            return [{ type: 'text', text: shortText(text) }];
           },
         },
         async execute(args, exec) {
@@ -376,7 +400,16 @@ export default {
         activeTab: state.activeTabId,
         lastError: state.lastError,
       },
-    }));
+    }), (args, value) => {
+      const r = value.result || {};
+      return ['状态: ' + r.state,
+        r.url ? '页面: ' + r.url : '',
+        r.title ? '标题: ' + r.title : '',
+        typeof r.tabs === 'number' ? '标签: ' + r.tabs : '',
+        r.activeTab ? '激活tab: ' + r.activeTab : '',
+        r.lastError ? '错误: ' + r.lastError : '',
+      ].filter(Boolean).join(' · ');
+    });
 
     registerTool('browser_open', '启动浏览器（若未运行）并在标签页中打开 url（优先复用现有激活标签，无标签时新建）。', {
       url: { type: 'string', description: '目标 URL' },
@@ -402,17 +435,24 @@ export default {
       res = await runAction(exec, 'newTab', { url: args.url }, { timeout: 15000 });
       await syncTabs();
       return res;
+    }, (args, value) => {
+      const r = value.result || {};
+      const n = value.tree && value.tree.nodes ? value.tree.nodes.length : null;
+      return '✓ 已打开 ' + (r.url || args.url) + (r.tabId ? ' (tab ' + r.tabId + ')' : '') + (n != null ? ' · 感知 ' + n + ' 个节点' : '');
     });
 
     registerTool('browser_navigate', '在激活标签页导航到 url 并等待加载完成。', {
       url: { type: 'string', description: '目标 URL' },
-    }, (args, exec) => runAction(exec, 'navigate', { url: args.url }, { timeout: 20000 }));
+    }, (args, exec) => runAction(exec, 'navigate', { url: args.url }, { timeout: 20000 }),
+      (args) => '✓ 已导航到 ' + args.url);
 
     registerTool('browser_go', '激活标签页历史前进或后退。', {
       direction: { type: 'string', enum: ['back', 'forward'], description: '方向' },
-    }, (args, exec) => runAction(exec, 'go', { direction: args.direction }));
+    }, (args, exec) => runAction(exec, 'go', { direction: args.direction }),
+      (args) => '✓ 已' + (args.direction === 'back' ? '返回上一页' : '前进到下一页'));
 
-    registerTool('browser_reload', '刷新激活标签页。', {}, (args, exec) => runAction(exec, 'reload', {}));
+    registerTool('browser_reload', '刷新激活标签页。', {}, (args, exec) => runAction(exec, 'reload', {}),
+      () => '✓ 已刷新当前页面');
 
     registerTool('browser_click', '在激活标签页点击。优先用 ref（来自 browser_* 返回的树节点 ref 字段，自动滚动到元素并点中心）；无 ref 时按视口 CSS 坐标点击。', {
       ref: { type: 'string', description: '树节点 ref（可选，优先）' },
@@ -421,16 +461,22 @@ export default {
     }, async (args, exec) => {
       if (!args.ref) state.lastClick = { x: args.x, y: args.y };
       return runAction(exec, 'click', { x: args.x, y: args.y, ref: args.ref }, { afterClick: true });
+    }, (args, value) => {
+      const near = value.tree && value.tree.near ? value.tree.near.length : null;
+      const at = args.ref ? 'ref=' + args.ref : '(' + args.x + ', ' + args.y + ')';
+      return '✓ 已点击 ' + at + (near != null ? ' · 附近节点 ' + near + ' 个' : '');
     });
 
     registerTool('browser_type', '在激活标签页输入文本（绕过 IME，中文可用；末尾换行触发回车）。', {
       text: { type: 'string', description: '要输入的文本' },
-    }, (args, exec) => runAction(exec, 'type', { text: args.text }));
+    }, (args, exec) => runAction(exec, 'type', { text: args.text }),
+      (args) => '✓ 已输入: ' + shortText(String(args.text || '').replace(/\n/g, '⏎'), 60));
 
     registerTool('browser_scroll', '在激活标签页滚动（先移动到 x,y 再滚 dx,dy）。', {
       x: { type: 'number' }, y: { type: 'number' },
       dx: { type: 'number', description: '水平滚动量' }, dy: { type: 'number', description: '垂直滚动量' },
-    }, (args, exec) => runAction(exec, 'scroll', { x: args.x, y: args.y, dx: args.dx, dy: args.dy }));
+    }, (args, exec) => runAction(exec, 'scroll', { x: args.x, y: args.y, dx: args.dx, dy: args.dy }),
+      (args) => '✓ 已滚动 dx=' + (args.dx || 0) + ' dy=' + (args.dy || 0));
 
     registerTool('browser_screenshot', '返回激活标签页当前帧 dataURL（base64 JPEG）与内在尺寸。', {}, async () => {
       try {
@@ -466,11 +512,19 @@ export default {
       } catch (e) {
         return errResult('NO_FRAME', '扩展截图失败：' + String((e && e.message) || e) + ' code=' + (e && e.code));
       }
+    }, (args, value) => {
+      const r = value.result || {};
+      return '📷 截图 ' + (r.width || 0) + '×' + (r.height || 0) + (r.seq ? ' (seq ' + r.seq + ')' : '') + '（画面数据已返回给模型）';
     });
 
     registerTool('browser_eval', '在激活标签页执行 JS 表达式并返回值（JSON 序列化）。', {
       expression: { type: 'string', description: 'JS 表达式' },
-    }, (args, exec) => runAction(exec, 'eval', { expression: args.expression }, { timeout: 15000 }));
+    }, (args, exec) => runAction(exec, 'eval', { expression: args.expression }, { timeout: 15000 }),
+      (args, value) => {
+        const r = value.result || {};
+        const v = r.value;
+        return '✓ ' + shortText(typeof v === 'string' ? v : JSON.stringify(v), 200);
+      });
 
     registerTool('browser_tabs', '列出全部标签（tabId、url、title、是否激活）。', {}, async (args, exec) => {
       try {
@@ -481,6 +535,10 @@ export default {
       const res = await sendCommand('tabs', {});
       await syncTabs();
       return { ok: true, result: { tabs: state.tabs }, tree: (await buildTree(exec)).tree };
+    }, (args, value) => {
+      const r = value.result || {};
+      const tabs = (r.tabs || []).map((t) => (t.active ? '▶' : '') + (t.title || t.url || ('tab ' + t.tabId)));
+      return '标签 ' + (r.tabs || []).length + ' 个: ' + shortText(tabs.join(', '), 200);
     });
 
     registerTool('browser_switch', '切换激活标签页（单激活模型：帧流/树/操作只针对激活标签）。', {
@@ -489,9 +547,10 @@ export default {
       const res = await runAction(exec, 'switch', { tabId: args.tabId });
       await syncTabs();
       return res;
-    });
+    }, (args) => '✓ 已切换到 tab ' + args.tabId);
 
-    registerTool('browser_activate', '把激活标签页带到前台并聚焦 Edge 窗口（供人直接操作真实页面）。', {}, (args, exec) => runAction(exec, 'activate', {}));
+    registerTool('browser_activate', '把激活标签页带到前台并聚焦 Edge 窗口（供人直接操作真实页面）。', {}, (args, exec) => runAction(exec, 'activate', {}),
+      () => '✓ 已把 Edge 窗口带到前台（人可直接操作）');
 
     registerTool('browser_stop', '停止浏览器（停 screencast 并 detach 全部标签，保留标签页）。', {}, async () => {
       try {
@@ -499,7 +558,7 @@ export default {
       } catch { /* ignore */ }
       stopBridge();
       return { ok: true, result: {} };
-    });
+    }, () => '✓ 浏览器已停止（标签页保留）');
 
     async function syncTabs() {
       try {
