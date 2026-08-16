@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    body { width: 280px; margin: 0; padding: 12px; font: 13px/1.5 system-ui, sans-serif; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    label { display: block; margin: 8px 0 4px; color: #666; }
+    input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; }
+    button { width: 100%; margin-top: 10px; padding: 7px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; }
+    button.secondary { background: #64748b; }
+    #status { margin-top: 10px; font-size: 12px; color: #555; white-space: pre-wrap; word-break: break-all; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+    .on { background: #22c55e; } .off { background: #94a3b8; }
+  </style>
+</head>
+<body>
+  <h1>dsh-bib bridge</h1>
+  <div><span class="dot" id="dot"></span><span id="state">未连接</span></div>
+  <label for="code">连接码（备用：自动发现失败时粘贴）</label>
+  <div id="coderow"><input id="code" placeholder="127.0.0.1:49152#a1b2..." autocomplete="off" spellcheck="false" /></div>
+  <button id="connect">连接</button>
+  <button id="disconnect" class="secondary">断开</button>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

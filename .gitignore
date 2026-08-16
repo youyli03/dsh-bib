@@ -1,0 +1,25 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# 运行时产物
+.runtime/
+
+# 构建产物（由 npm run build / npm run deploy 生成）
+plugin/host.js
+deploy.json
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# 临时文件
+*.tmp
+*.log
+preview_check.jpg

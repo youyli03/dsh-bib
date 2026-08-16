@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "dsh-bib",
+  "version": "0.1.0",
+  "description": "DSH 内嵌浏览器：真实标签页 CDP 代理（attach 专用标签页，帧流与命令经本地中继桥转发）",
+  "minimum_chrome_version": "116",
+  "permissions": ["debugger", "tabs", "storage", "alarms"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "dsh-bib"
+  }
+}
