@@ -4,6 +4,8 @@
 
 通过 Edge 扩展（`chrome.debugger`）+ 本地中继桥，让 AI 代理和人类共同操作同一个真实浏览器标签页：AX 树感知、坐标/ref 点击、实时画面预览、**单标签锁定**（AI 操作不打断你的浏览）。复用你的真实 Edge 登录态，无需 headless、无需重新登录。
 
+![dsh-bib 实际运行预览](docs/preview.png)
+
 > 详细规格见 [`docs/spec.md`](docs/spec.md)（v1 定稿 · 已实现）。
 
 ---
