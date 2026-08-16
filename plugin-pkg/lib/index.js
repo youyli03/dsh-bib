@@ -22,7 +22,6 @@ export default {
       lastClick: null,        // {x, y}
       tabs: [],
       activeTabId: null,
-      lastTreeSpan: null,     // 上一份树所在 surface 区间 {start, end}（尽力而为压缩用）
       lastError: '',
     };
 
@@ -207,10 +206,16 @@ export default {
     }
 
     // ---------------- 树契约 ----------------
+    // 每次 browser_* 工具调用结束都返回**最新完整树节点**（可被下一次调用覆盖）：
+    // - changed:true  → rev 递增 + 完整 nodes（模型拿新树操作）
+    // - changed:false → rev 不变，但仍附最新 nodes 快照（模型始终有可点击的当前树，
+    //   而不是只有 summary —— 旧实现只回摘要导致模型在页面静止时失去树锚点）
+    // 节点字段：{role, name, ref, x, y, w, h, data?}
     function hashTree(nodes) {
       let s = '';
       for (const n of nodes.slice(0, 300)) {
-        s += n.role + '|' + (n.name || '') + '|' + n.x + ',' + n.y + ',' + n.w + ',' + n.h + ';';
+        s += n.role + '|' + (n.name || '') + '|' + (n.data ? JSON.stringify(n.data) : '') +
+          '|' + n.x + ',' + n.y + ',' + n.w + ',' + n.h + ';';
       }
       return s;
     }
@@ -236,6 +241,10 @@ export default {
         const changed = hash !== state.lastTreeHash;
         state.lastTreeHash = hash;
         const near = afterClick ? nearest(nodes, state.lastClick, 5) : undefined;
+        // 每次工具调用都把对话里更早的树整体压缩掉，只留本次最新树：
+        // 压缩在返回新树前执行，本次 tool/result 尚未写入 surface，因此扫描到的
+        // browser_* 结果全部是历史树；压缩后本次结果成为唯一完整树。
+        await compactOldTrees(exec);
         if (changed) {
           state.rev++;
           out.tree = {
@@ -244,11 +253,13 @@ export default {
             nodes: nodes.slice(0, 300),
             ...(near ? { near } : {}),
           };
-          tryCompactOldTree(exec);
         } else {
+          // 页面未变化时也回传最新 nodes 快照（可被下一次调用覆盖）：
+          // 保证模型在连续操作/静态页面下始终持有可点击的树，而非空摘要。
           out.tree = {
             rev: state.rev,
             changed: false,
+            nodes: nodes.slice(0, 300),
             url: state.url,
             summary: { title: state.title, nodeCount: nodes.length },
             ...(near ? { near } : {}),
@@ -258,13 +269,60 @@ export default {
       return out;
     }
 
-    async function tryCompactOldTree(exec) {
+    // 历史树压缩：纯正则 + session.append replace 重写，无模型、秒级。
+    // 树块由 treeSection 渲染时带上 ⟦BIBTREE⟧ 边界标记；每次 browser_* 调用返回新树前，
+    // 扫描 surface 中所有历史 tool/result，用正则把旧树块整体替换成一行占位，
+    // 通过 session.append('tool/result', {surfaceOp:{op:'replace'}}) 重写该节点
+    // （官方 shadow-price 协议：replace 前 append compaction/prune 记账）。
+    // 本次结果尚未写入 surface，因此扫描到的树全部是历史树；压缩后本次结果成为唯一完整树。
+    async function compactOldTrees(exec) {
       try {
-        const compaction = ctx.get('compaction');
         const agent = exec && exec.agent;
-        const span = state.lastTreeSpan;
-        if (!compaction || !agent || !span || typeof span.end !== 'number') return;
-        await compaction.compactRegion(span.start, span.end, agent);
+        if (!agent) return;
+        const session = agent.session;
+        const nodes = session.surface ? session.surface.nodes : null;
+        const events = session.events;
+        if (!nodes || !events || !Array.isArray(nodes) || nodes.length === 0) return;
+
+        const tokenMeter = ctx.get('tokenMeter');
+        const TREE_BLOCK_RE = /\n⟦BIBTREE rev=\d+⟧[\s\S]*?\n⟦\/BIBTREE⟧/g;
+        const PLACEHOLDER = '\n（旧树已压缩，最新树见最近一次操作）\n';
+
+        let prunedCount = 0;
+        for (const seq of [...nodes]) {
+          const ev = events[seq];
+          if (!ev || ev.type !== 'tool/result') continue;
+          const blocks = ev.data && ev.data.message && ev.data.message.content;
+          const result = Array.isArray(blocks) && blocks[0];
+          if (!result || result.type !== 'tool-result' || !Array.isArray(result.content)) continue;
+          const joined = result.content
+            .map((b) => (b && b.type === 'text' ? b.text : ''))
+            .join('\n');
+          if (!joined.includes('⟦BIBTREE')) continue;
+
+          const newContent = result.content.map((b) => {
+            if (!b || b.type !== 'text' || !b.text.includes('⟦BIBTREE')) return b;
+            const text = b.text.replace(TREE_BLOCK_RE, PLACEHOLDER);
+            return Object.assign({}, b, { text });
+          });
+          const shadowedTokenCount = tokenMeter && typeof tokenMeter.estimateMessage === 'function'
+            ? tokenMeter.estimateMessage(ev.data.message)
+            : 0;
+          try {
+            session.append('compaction/prune', {
+              shadowedRange: { start: seq, end: seq },
+              shadowedSeqs: [seq],
+              shadowedTokenCount,
+            });
+          } catch { /* 记账失败不阻塞重写 */ }
+          const message = Object.assign({}, ev.data.message, { content: [Object.assign({}, result, { content: newContent })] });
+          session.append('tool/result', Object.assign({}, ev.data, { message }), {
+            surfaceOp: { op: 'replace', start: seq, end: seq },
+            sourceEventSeqs: [seq],
+          });
+          prunedCount++;
+        }
+        if (prunedCount > 0) console.log('[dsh-bib] 旧树压缩:', prunedCount, '个历史结果已重写');
       } catch (e) {
         console.log('[dsh-bib] 旧树压缩跳过:', (e && e.message) || e);
       }
@@ -356,11 +414,22 @@ export default {
       const tree = value && value.tree;
       if (!tree || !Array.isArray(tree.nodes) || tree.nodes.length === 0) return '';
       const cap = maxNodes || 40;
-      const lines = tree.nodes.slice(0, cap).map((n) =>
-        '[' + (n.ref || '?') + '] ' + (n.role || '') + (n.name ? ' "' + n.name + '"' : '') +
-        ' @(' + n.x + ',' + n.y + ') ' + n.w + 'x' + n.h);
+      const lines = tree.nodes.slice(0, cap).map((n) => {
+        let extra = '';
+        if (n.data && typeof n.data === 'object') {
+          const parts = [];
+          if (n.data.economy && n.data.economy.type) parts.push(n.data.economy.type);
+          if (n.data.economy && n.data.economy.rarity) parts.push(n.data.economy.rarity);
+          if (parts.length === 0 && n.data.name) parts.push(n.data.name);
+          if (parts.length) extra = ' [' + parts.join(' · ') + ']';
+        }
+        return '[' + (n.ref || '?') + '] ' + (n.role || '') + (n.name ? ' "' + n.name + '"' : '') +
+          extra + ' @(' + n.x + ',' + n.y + ') ' + n.w + 'x' + n.h;
+      });
       const more = tree.nodes.length > cap ? '\n… 共 ' + tree.nodes.length + ' 个节点' : '';
-      return '\n树(rev ' + (tree.rev || '?') + '):\n' + lines.join('\n') + more;
+      // 树块带边界标记：历史树压缩（compactOldTrees）用正则按标记整体替换，
+      // 只压缩旧树、保留工具结果的其他内容（如点击坐标/附近节点）。
+      return '\n⟦BIBTREE rev=' + (tree.rev || '?') + '⟧\n' + lines.join('\n') + more + '\n⟦/BIBTREE⟧';
     }
     function registerTool(name, description, params, handler, render) {
       const tool = defineTool({

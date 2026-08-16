@@ -17,10 +17,13 @@ const state = {
   creatingOwn: false,   // 正在创建/接管自己的标签（onCreated 关闭逻辑跳过）
 };
 
-const INTERACTIVE = new Set([
+// CDP Accessibility 域的交互角色集合（浏览器权威 AX 树过滤用；
+// 语义来自 Chromium 引擎，对所有站点通用，无需站点特例）
+const AX_ROLES = new Set([
   'button', 'link', 'checkbox', 'combobox', 'menuitem', 'radio', 'slider',
   'spinbutton', 'textbox', 'searchbox', 'listbox', 'tab', 'switch', 'treeitem',
-  'option', 'input', 'menu', 'menubar',
+  'option', 'menu', 'menubar', 'heading', 'image', 'gridcell', 'cell',
+  'columnheader', 'rowheader', 'row', 'progressindicator', 'alert', 'dialog',
 ]);
 
 // ---------------- 基础 helper ----------------
@@ -34,19 +37,6 @@ function send(tabId, method, params) {
       else resolve(res);
     });
   });
-}
-
-function strVal(v) { return v && v.value !== undefined ? String(v.value) : ''; }
-
-function boundingBox(n) {
-  if (!n.properties) return null;
-  for (const p of n.properties) {
-    if (p.name === 'bounding box' && p.value && p.value.value &&
-        typeof p.value.value.x === 'number' && typeof p.value.value.y === 'number') {
-      return { x: p.value.value.x, y: p.value.value.y, width: p.value.value.width || 0, height: p.value.value.height || 0 };
-    }
-  }
-  return null;
 }
 
 const extOrigin = () => chrome.runtime.getURL('').replace(/\/$/, '');
@@ -128,11 +118,11 @@ async function injectHeartbeat(tabId) {
 // 参考 chrome-mcp-server：从 DOM 推断 role/label，节点带 ref_* 稳定引用 + 视口坐标。
 const AX_TREE_SCRIPT = `
 (() => {
-  const MAX_NODES = 800;
+  const MAX_NODES = 1000;
   const out = [];
   if (!window.__dshbibRefs) window.__dshbibRefs = {};
   if (!window.__dshbibRefCounter) window.__dshbibRefCounter = 0;
-  const INTERACTIVE = new Set(['button','link','checkbox','combobox','menuitem','radio','slider','spinbutton','textbox','searchbox','listbox','tab','switch','treeitem','option','menu','heading']);
+  const INTERACTIVE = new Set(['button','link','checkbox','combobox','menuitem','radio','slider','spinbutton','textbox','searchbox','listbox','tab','switch','treeitem','option','menu','heading','image']);
   const inferRole = (el) => {
     const role = el.getAttribute && el.getAttribute('role');
     if (role) return role;
@@ -140,6 +130,28 @@ const AX_TREE_SCRIPT = `
     const type = (el.getAttribute && el.getAttribute('type')) || '';
     const map = { a:'link', button:'button', input: type==='submit'||type==='button'?'button':type==='checkbox'?'checkbox':type==='radio'?'radio':'textbox', select:'combobox', textarea:'textbox', h1:'heading',h2:'heading',h3:'heading',h4:'heading',h5:'heading',h6:'heading', img:'image', nav:'navigation', main:'main', header:'banner', footer:'contentinfo', section:'region', article:'article', aside:'complementary', form:'form', table:'table', ul:'list', ol:'list', li:'listitem', label:'label' };
     return map[tag] || 'generic';
+  };
+  // data-* 语义提取：优先 data-economy-item（Steam 库存旧版），否则通用 data-name/data-title/data-label
+  const pickData = (el) => {
+    const out = {};
+    const eco = el.getAttribute && el.getAttribute('data-economy-item');
+    if (eco) {
+      try {
+        const j = JSON.parse(eco);
+        if (j && typeof j === 'object') {
+          if (j.name) out.name = String(j.name);
+          if (j.type) out.type = String(j.type);
+          if (j.rarity) out.rarity = String(j.rarity);
+          if (j.market_hash_name) out.market_hash_name = String(j.market_hash_name);
+          return out;
+        }
+      } catch {}
+    }
+    for (const k of ['data-name','data-title','data-label','data-tooltip']) {
+      const v = el.getAttribute && el.getAttribute(k);
+      if (v && String(v).trim()) { out[k.slice(5)] = String(v).trim(); break; }
+    }
+    return out;
   };
   const inferLabel = (el) => {
     const aria = el.getAttribute && el.getAttribute('aria-label');
@@ -150,6 +162,20 @@ const AX_TREE_SCRIPT = `
     if (title && title.trim()) return title.trim();
     const alt = el.getAttribute && el.getAttribute('alt');
     if (alt && alt.trim()) return alt.trim();
+    const alb = el.getAttribute && el.getAttribute('aria-labelledby');
+    if (alb) {
+      const refEl = document.getElementById(alb);
+      if (refEl && refEl.textContent && refEl.textContent.trim()) return refEl.textContent.trim().slice(0, 100);
+    }
+    const d = pickData(el);
+    if (d.name) return d.name;
+    // 父级 data-* 回退（Steam 卡片 img 在 div.item 内，名称可能在祖先上）
+    let p = el.parentElement;
+    while (p && p !== document.body) {
+      const pd = pickData(p);
+      if (pd.name) return pd.name;
+      p = p.parentElement;
+    }
     const tag = (el.tagName||'').toLowerCase();
     if (tag==='input') { const v=el.value||''; if (v && v.length<50 && v.trim()) return v.trim(); }
     if (['button','a','summary'].includes(tag)) {
@@ -158,8 +184,30 @@ const AX_TREE_SCRIPT = `
       // 标题常包在嵌套元素内（如小红书卡片 <a class="title"> 内是 span）：回退取 textContent
       const all = (el.textContent || '').trim();
       if (all) return all.slice(0, 120);
+      // 无文本链接（Steam 库存物品卡片 <a class="inventory_item_link" href="#730_2_xxx">）：
+      // 从 href 的 #id 提取可读标识，让模型能感知并点击这些卡片
+      if (tag === 'a') {
+        const href = el.getAttribute && el.getAttribute('href');
+        if (href && href.startsWith('#') && href.length > 1) {
+          const id = href.slice(1);
+          if (/^[A-Za-z0-9_]+$/.test(id)) return 'item ' + id;
+        }
+      }
     }
     return '';
+  };
+  // 节点附带 data 摘要：data-* 属性（值 <60 字符）+ economy 语义
+  const collectData = (el) => {
+    const d = {};
+    const eco = pickData(el);
+    if (eco.name || eco.type || eco.rarity || eco.market_hash_name) d.economy = eco;
+    for (const a of (el.attributes || [])) {
+      if (a.name.startsWith('data-') && a.name !== 'data-economy-item') {
+        const v = String(a.value || '');
+        if (v && v.length < 60) d[a.name] = v;
+      }
+    }
+    return Object.keys(d).length ? d : undefined;
   };
   const walk = (el, depth) => {
     if (out.length >= MAX_NODES || depth > 30) return;
@@ -169,10 +217,18 @@ const AX_TREE_SCRIPT = `
         const rect = child.getBoundingClientRect();
         if (rect.width > 1 && rect.height > 1 && rect.bottom > 0 && rect.top < (window.innerHeight||800) && rect.right > 0 && rect.left < (window.innerWidth||1200)) {
           const name = inferLabel(child);
-          if (!name && role !== 'textbox' && role !== 'image') continue;
+          const data = collectData(child);
+          // 无名称节点：textbox/image 保留；link/button 有 href/data/id 也保留（可点击坐标仍有用）
+          if (!name && role !== 'textbox' && role !== 'image') {
+            const href = child.getAttribute && child.getAttribute('href');
+            const id = child.getAttribute && child.getAttribute('id');
+            if (!href && !data && !id) continue;
+          }
           const ref = 'ref_' + (++window.__dshbibRefCounter);
           try { window.__dshbibRefs[ref] = new WeakRef(child); } catch (e) { window.__dshbibRefs[ref] = child; }
-          out.push({ role, name: (name||'').slice(0,100), ref, x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) });
+          const node = { role, name: (name||'').slice(0,100), ref, x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) };
+          if (data) node.data = data;
+          out.push(node);
         }
       }
       walk(child, depth + 1);
@@ -196,6 +252,8 @@ async function attachTab(tabId) {
   state.attached.add(tabId);
   await send(tabId, 'Page.enable');
   await send(tabId, 'Runtime.enable');
+  // DOM.enable：AX 树 backendDOMNodeId → DOM 元素解析（ref 点击/坐标补齐）
+  try { await send(tabId, 'DOM.enable'); } catch { /* 无 DOM 域：AX 补充节点降级 */ }
   // 心跳注入不阻塞：后台标签页面加载早期 CDP 命令可能挂起，heartbeat 只是保活辅助
   injectHeartbeat(tabId).catch(() => {});
 }
@@ -415,8 +473,103 @@ async function doEval(tabId, expression) {
 }
 
 async function doTree(tabId) {
-  const r = await send(tabId, 'Runtime.evaluate', { expression: AX_TREE_SCRIPT, returnByValue: true });
-  return { ok: true, result: { nodes: (r.result && r.result.value) || [] } };
+  // 双通道树：DOM walk 提供 ref 骨架（点击链路），CDP Accessibility 域提供
+  // 浏览器引擎权威的 role/name（对所有站点通用：aria 关联、label[for]、
+  // shadow DOM 内容、组合文本等，DOM 启发式推断不到的语义）。
+  let domNodes = [];
+  try {
+    const r = await send(tabId, 'Runtime.evaluate', { expression: AX_TREE_SCRIPT, returnByValue: true });
+    domNodes = (r.result && r.result.value) || [];
+  } catch { /* DOM walk 失败不阻塞 */ }
+
+  let axParsed = [];
+  try {
+    const ax = await send(tabId, 'Accessibility.getFullAXTree');
+    const list = (ax.nodes || []).filter((n) => !n.ignored);
+    for (const n of list) {
+      const role = n.role && n.role.value;
+      if (!role || !AX_ROLES.has(role)) continue;
+      let name = '';
+      let box = null;
+      for (const p of (n.properties || [])) {
+        if (p.name === 'name' && p.value && p.value.value != null) name = String(p.value.value);
+        if (p.name === 'bounding box' && p.value && p.value.value) box = p.value.value;
+      }
+      if (!box || !(box.width > 1 && box.height > 1)) continue;
+      axParsed.push({
+        role, name: name.slice(0, 100),
+        x: Math.round(box.x), y: Math.round(box.y),
+        w: Math.round(box.width), h: Math.round(box.height),
+        backendNodeId: n.backendDOMNodeId,
+      });
+    }
+  } catch { /* AX 域不可用：回退纯 DOM 树 */ }
+
+  if (!axParsed.length) {
+    return { ok: true, result: { nodes: domNodes, source: 'dom' } };
+  }
+
+  // 匹配：按中心距离 + 重叠把 AX 语义覆盖到 DOM 骨架节点上
+  const used = new Set();
+  const nodes = domNodes.map((d) => {
+    let best = -1;
+    let bestD = Infinity;
+    const dcx = d.x + d.w / 2;
+    const dcy = d.y + d.h / 2;
+    for (let i = 0; i < axParsed.length; i++) {
+      if (used.has(i)) continue;
+      const a = axParsed[i];
+      const acx = a.x + a.w / 2;
+      const acy = a.y + a.h / 2;
+      const dist = Math.hypot(acx - dcx, acy - dcy);
+      const inside = dcx > a.x && dcx < a.x + a.w && dcy > a.y && dcy < a.y + a.h;
+      if ((dist < 48 || inside) && dist < bestD) { best = i; bestD = dist; }
+    }
+    if (best >= 0) {
+      used.add(best);
+      const a = axParsed[best];
+      const out = Object.assign({}, d);
+      if (a.role) out.role = a.role;
+      // AX name 优先（浏览器权威）；DOM 名更长的场景（卡片文本聚合）保留 DOM 名
+      if (a.name && (!out.name || a.name.length >= out.name.length)) out.name = a.name;
+      return out;
+    }
+    return d;
+  });
+
+  // AX 独有交互节点（shadow DOM / iframe 内容等 DOM walk 覆盖不到）：
+  // 用 backendDOMNodeId 解析 DOM 元素并在页面注册 ref，保证可点击。
+  for (let i = 0; i < axParsed.length; i++) {
+    if (used.has(i)) continue;
+    const a = axParsed[i];
+    if (!a.name && a.role !== 'image' && a.role !== 'textbox') continue;
+    if (a.backendNodeId == null) continue;
+    try {
+      const r = await send(tabId, 'DOM.resolveNode', { backendNodeId: a.backendNodeId });
+      const objectId = r && r.object && r.object.objectId;
+      if (!objectId) continue;
+      const reg = await send(tabId, 'Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function() {
+          if (!window.__dshbibRefs) window.__dshbibRefs = {};
+          if (!window.__dshbibRefCounter) window.__dshbibRefCounter = 0;
+          const el = this;
+          const rect = el.getBoundingClientRect();
+          if (!rect || rect.width <= 1 || rect.height <= 1) return null;
+          const ref = 'ref_' + (++window.__dshbibRefCounter);
+          try { window.__dshbibRefs[ref] = new WeakRef(el); } catch (e) { window.__dshbibRefs[ref] = el; }
+          return { ref, x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) };
+        }`,
+        returnByValue: true,
+      });
+      const v = reg.result && reg.result.value;
+      if (v && v.ref) {
+        nodes.push({ role: a.role, name: a.name, ref: v.ref, x: v.x, y: v.y, w: v.w, h: v.h });
+      }
+    } catch { /* 解析失败跳过 */ }
+  }
+
+  return { ok: true, result: { nodes, source: 'ax+dom' } };
 }
 
 async function doScreenshot(tabId) {

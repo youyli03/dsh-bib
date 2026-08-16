@@ -22,7 +22,7 @@
 | 能力 | 说明 |
 |---|---|
 | `browser_*` 工具集 | status / open / navigate / go / reload / click / type / scroll / screenshot / eval / tabs / switch / activate / stop |
-| AX 树感知 | 每次操作后返回页面语义树（role + 名称 + 视口坐标 + `ref_N` 稳定引用），可点击的卡片/链接自动收录 |
+| AX 树感知 | 每次操作后返回**最新完整**语义树（role + 名称 + 视口坐标 + `ref_N` 稳定引用）；双通道提取：DOM walk 骨架 + CDP `Accessibility` 浏览器权威语义（覆盖 aria/shadow DOM，全站点通用），`data-*` 与无文本链接兜底（Steam 库存卡片类） |
 | ref 点击 | 树节点带 ref，点击时自动滚动到元素并点中心，无需手动算坐标 |
 | 实时画面 | 操作后主动截帧 + 2s 周期刷新，页面自身变化（懒加载/动画）也能跟上 |
 | 单标签锁定 | target=_blank 新标签自动关闭；AI 操作（导航/点击/输入/滚动）全部后台进行，浏览器焦点不被抢 |

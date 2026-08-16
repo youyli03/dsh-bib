@@ -35,11 +35,15 @@
 
 ### 1.3 AX 树（随操作返回，rev/changed/near 契约）
 
-- **页面注入 DOM 遍历**生成树（参考 chrome-mcp-server）：`inferRole`/`inferLabel` 从 DOM 推断，节点带 `{role, name, ref, x, y, w, h}`（ref 为 `ref_N` 稳定引用 + WeakRef 映射）。
-- 每次 `browser_*` 操作后返回 `{result, tree}`；`tree = {rev, changed, nodes?, summary?, near?}`。
+- **双通道语义提取**：DOM walk（ref 骨架）+ CDP `Accessibility.getFullAXTree`（浏览器引擎权威 role/name）。
+  - 浏览器无障碍计算覆盖 aria 关联、`label[for]`、组合文本、shadow DOM 内容等 DOM 启发式推断不到的语义 —— **对所有站点通用，无需站点特例**。
+  - AX 独有交互节点（shadow DOM / iframe 内容等 DOM walk 覆盖不到的）经 `DOM.resolveNode` 在页面注册 ref，保证可点击。
+  - DOM 侧兜底：`data-*` 语义回退（`data-economy-item` JSON、`data-name`/`data-title`/`data-label`/`data-tooltip`）、父级 data 回退、无文本链接从 href `#id` 提取标识（Steam 库存卡片类）、节点附带 `data` 字段摘要。
+- **每次操作后返回完整最新树**：`rev` 只在 `changed:true` 时递增；`changed:false` 时**仍回传最新 nodes 快照**（可被下一次调用覆盖），保证模型在连续操作/静态页面下始终持有可点击的树，而非空摘要。
+- **历史树自动压缩（纯正则重写，无模型）**：每次 `browser_*` 调用返回新树前，扫描 session surface 中所有历史 `tool/result`，树块由 `treeSection` 渲染时自带 `⟦BIBTREE⟧` 边界标记，用正则把旧树整体替换成一行占位（保留工具结果的其他内容如点击坐标/附近节点）；通过 `session.append('tool/result', {surfaceOp:{op:'replace'}})` 官方机制重写节点，并先 append `compaction/prune` 记账（shadow-price 协议）—— 对话中始终只有**最新一份完整树**，无 LLM 摘要开销。
+- 节点字段：`{role, name, ref, x, y, w, h, data?}`（ref 为 `ref_N` 稳定引用 + WeakRef 映射）。
 - **操作后延迟 400ms 抓树**，等待 SPA/异步渲染，保证树反映最新页面。
 - **ref 点击**：`browser_click {ref}` 解引用 → `scrollIntoView` → 元素中心坐标 → 真实点击。
-- `rev` 只在 `changed:true` 时递增；`changed:false` 附最小摘要（防上下文 compact 后无锚点）。
 
 ### 1.4 用户侧 UI
 
