@@ -299,7 +299,7 @@ async function doClick(tabId, x, y, ref) {
     const v = r.result && r.result.value;
     if (v && v.ok) return { ok: true, result: {} };
   } catch { /* DOM 派发失败，回退 CDP */ }
-  // 回退：CDP 坐标点击（需标签在前台；由 execute 的 needsFront 保证激活）
+  // 回退：CDP 坐标点击（需标签在前台；单标签锁定模型下此路径极少触发）
   if (ref) {
     const r = await send(tabId, 'Runtime.evaluate', {
       expression: `new Promise((resolve) => {
@@ -346,7 +346,7 @@ async function doType(tabId, text) {
   const t = String(text || '');
   // DOM 方式输入（后台可用，不切走）：聚焦当前激活元素 → 设置值 → 派发 input 事件。
   // 对 React/Vue 受控组件用原生 setter 触发（避免框架检测不到变更）。
-  // 失败（无聚焦输入元素）回退 CDP Input.insertText（需前台，由 execute needsFront 激活）。
+  // 失败（无聚焦输入元素）回退 CDP Input.insertText（需前台；单标签锁定模型下极少触发）。
   try {
     const esc = (s) => JSON.stringify(s);
     const r = await send(tabId, 'Runtime.evaluate', {
