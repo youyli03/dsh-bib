@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
 .dshbib-btn { padding: 3px 8px; border-radius: 6px; border: 1px solid var(--dsw-alias-border-l2, #3f3f46); background: var(--dsw-alias-interactive-bg-hover, #27272a); cursor: pointer; font-size: 12px; color: var(--dsw-alias-label-primary, #e4e4e7); }
 .dshbib-url { flex: 1; min-width: 0; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--dsw-alias-border-l2, #3f3f46); background: transparent; color: var(--dsw-alias-label-primary, #e4e4e7); font-size: 12px; }
 .dshbib-viewport { position: relative; background: conic-gradient(#16161a 25%, #1c1c21 0 50%, #16161a 0 75%, #1c1c21 0); }
-.dshbib-img { display: block; width: 100%; max-height: 58vh; object-fit: contain; user-select: none; }
+.dshbib-img { display: block; width: 100%; max-height: clamp(160px, calc(100vh - 480px), 58vh); object-fit: contain; user-select: none; }
 .dshbib-placeholder { padding: 40px 12px; text-align: center; color: var(--dsw-alias-label-tertiary, #a1a1aa); }
 .dshbib-foot { padding: 4px 10px; border-top: 1px solid var(--dsw-alias-separator-primary, #3f3f46); color: var(--dsw-alias-label-secondary, #a1a1aa); font-size: 11px; }
 .dshbib-code { padding: 8px 10px; border-top: 1px solid var(--dsw-alias-separator-primary, #3f3f46); font-size: 11px; color: var(--dsw-alias-label-secondary, #a1a1aa); }
