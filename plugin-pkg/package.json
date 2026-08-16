@@ -1,0 +1,28 @@
+{
+  "name": "dsh-bib",
+  "version": "0.1.0",
+  "description": "DSH 内嵌浏览器：真实标签页 CDP 代理（browser_* 工具 + AX 树 + 单标签锁定）",
+  "type": "module",
+  "private": true,
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

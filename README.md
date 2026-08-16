@@ -48,7 +48,9 @@
 
 - **扩展**（`extension/`）：MV3 service worker，`chrome.debugger` attach 真实标签页，转发 CDP 帧/事件到桥，从中继桥取命令执行。
 - **中继桥**（`bridge/bridge.js`）：零依赖 Node http 服务，命令队列（FIFO）、长轮询、鉴权（X-Bib-Token + Origin 校验）、CORS。
-- **DSH 插件**（`plugin/host.js` + `plugin/client.jsx`）：Host 半区提供 14 个 `browser_*` 工具 + `bib/*` RPC + 自动发现路由；Client 半区把浏览器窗口注入 `conversation.input.dock`。
+- **DSH 插件**：
+  - **持久静态插件**（`plugin-pkg/`）：npm 包形式固化的 bundle，挂进 web profile 后**重启 DSH 仍然存在**。Host 半区（`lib/index.js`）提供 14 个 `browser_*` 工具 + `/dsh-bib/*` HTTP RPC + 自动发现路由；Client 半区（`lib/client.js`，ModuleLoader bundle）把浏览器窗口注入 `conversation.input.dock`。
+  - 动态版本（`plugin/` + `deploy.json`）：开发/演示用，经 `cordis_define` 加载，**重启后消失**。
 
 ## 安装
 
@@ -58,17 +60,16 @@
 2. 打开「开发人员模式」
 3. 点击「加载解压缩的扩展」，选择本仓库的 `extension/` 目录
 
-### 2. 部署 DSH 插件
+### 2. 安装持久静态插件（一键，重启仍在）
 
-一条命令生成部署描述文件（内联桥源码 + host/client 代码）：
-
-```bash
-npm run build    # 生成 plugin/host.js（内联桥代码）
-npm run deploy   # 生成 deploy.json（host + client 完整代码 + 安装说明）
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-static.ps1
 ```
 
-然后在 DSH 对话中对 AI 说：**「读取 deploy.json 并部署 dsh-bib」**——AI 会用 `cordis_define` 提交代码并激活。桥代码已内联，**无需任何绝对路径配置，clone 即用**。
+脚本会把 `plugin-pkg` 以 junction 挂进 `~/.dsh/profiles/web/node_modules`、补 `@deepseek-ai/dsh-tools` 解析链、在 profile 的 `package.json` 里追加依赖与 bundle（幂等，可重复运行）。然后**重启 `dsh web`** 生效，之后每次重启都在。
 
+> 旧版动态安装（`npm run build` + `npm run deploy` + 让 AI 用 `cordis_define` 部署）仅用于开发调试，重启即失效。
+>
 > 若 DSH Web 端口不是 3080，修改 `extension/background.js` 顶部的 `DSH_ORIGIN`（唯一需要改的位置）。
 
 ### 3. 启动
@@ -110,7 +111,8 @@ dsh-bib/
 │   └── archive/       # 历史设计文档
 ├── extension/         # Edge MV3 扩展（background + popup）
 ├── plugin/            # DSH 动态插件（host.template.js + 构建生成的 host.js + client.jsx）
-└── scripts/           # 构建脚本（build-host.mjs：内联桥源码生成 host.js）
+├── plugin-pkg/        # DSH 持久静态插件（lib/index.js Host + lib/client.js Client + cordis.patch.yml）
+└── scripts/           # 构建脚本（build-host.mjs / deploy.mjs / install-static.ps1）
 ```
 
 ## 已知限制

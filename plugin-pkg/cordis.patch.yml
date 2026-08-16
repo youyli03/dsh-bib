@@ -1,0 +1,4 @@
+# dsh-bib bundle patch — 声明插件挂载行
+- insert:
+    - id: dsh-bib
+      name: 'dsh-bib'
