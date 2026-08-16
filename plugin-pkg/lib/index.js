@@ -433,6 +433,10 @@ export default {
       } catch (e) {
         return errResult(e.code || 'BRIDGE_ERROR', (e && e.message) || String(e));
       }
+      // newTab：结果带 tabId，绑定为会话专属标签后再建树（否则 tree 无 tabId 会串到别的会话）
+      if (cmdName === 'newTab' && res && res.tabId != null) {
+        st.activeTabId = res.tabId;
+      }
       const treeWrap = await (async () => {
         await sleep(400);
         return buildTreeFor(exec, sessionId, opts.afterClick);
@@ -578,6 +582,9 @@ export default {
         }
       } catch { /* tabs/newTab 失败 → 兜底 */ }
       res = await runAction(exec, 'newTab', { url: args.url }, { timeout: 15000 });
+      if (res && res.ok && res.result && res.result.tabId != null) {
+        st.activeTabId = res.result.tabId;
+      }
       await syncTabs(sessionId);
       return res;
     }, (args, value) => {
