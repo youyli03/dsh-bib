@@ -13,6 +13,8 @@ const state = {
   polling: false,
   loadWait: null,       // navigate 等待 domContent
   loadTimer: null,
+  lastModelOpAt: 0,     // 最近一次模型交互命令的时间戳（空白弹窗归因用）
+  creatingOwn: false,   // 正在创建/接管自己的标签（onCreated 关闭逻辑跳过）
 };
 
 const INTERACTIVE = new Set([
@@ -455,7 +457,14 @@ async function doActivate(tabId) {
 }
 
 async function doNewTab(url) {
-  const tab = await chrome.tabs.create({ url: url || 'about:blank', active: false });
+  // creatingOwn：我们自己创建的标签不受 onCreated 关闭逻辑干预（防自伤竞态）
+  state.creatingOwn = true;
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url: url || 'about:blank', active: false });
+  } finally {
+    state.creatingOwn = false;
+  }
   state.tabs.set(tab.id, { url: tab.url || '', title: tab.title || '' });
   if (state.tabId != null) await stopScreencast(state.tabId);
   state.tabId = tab.id;
@@ -590,6 +599,11 @@ async function execute(cmd) {
   const tabId = cmd.tabId !== undefined ? cmd.tabId : state.tabId;
   // 单标签锁定模型：click/scroll/type 均已 DOM 化（后台可用，不切走浏览器焦点）。
   // 无命令需要强制前台 —— 浏览器焦点完全不受 AI 操作影响。
+  // 交互命令打时间戳：随后的空白弹窗可归因于本次模型操作并自动关闭
+  if (cmd.cmd === 'click' || cmd.cmd === 'type' || cmd.cmd === 'navigate' ||
+      cmd.cmd === 'scroll' || cmd.cmd === 'go' || cmd.cmd === 'reload' || cmd.cmd === 'switch') {
+    state.lastModelOpAt = Date.now();
+  }
   try {
     return await Promise.race([
       dispatch(cmd, tabId),
@@ -738,14 +752,25 @@ function isDshPage(url) {
   }
 }
 
-// 新标签处理：只处理"从当前 attach 标签弹出"的 target=_blank 新标签 —— 立即关闭，
-// 让 AI 始终在同一标签页操作（单标签模型）。其它新标签（用户手动开的）不干预。
+// 新标签处理：单标签锁定 —— 关闭"从当前 attach 标签弹出"的新标签。
+// target=_blank 链接通常带 openerTabId，直接归因关闭；
+// 现代站点用 noopener/noreferrer（openerTabId 为 null）或 window.open('') 开的
+// 空白标签无法靠 opener 归因 —— 用"空白页 + 刚有模型交互"启发式兜底关闭，
+// 避免空白标签堆积，同时不干预用户自己（非模型操作期间）开的标签。
+function isBlankUrl(url) {
+  if (!url) return true;
+  const u = String(url).toLowerCase();
+  return u === 'about:blank' || u.startsWith('about:blank#') || u === 'about:blank#blocked';
+}
 chrome.tabs.onCreated.addListener((tab) => {
   if (!state.base || !tab || tab.id == null) return;
+  if (state.creatingOwn) return; // 我们自己创建/接管的标签（newTab/连接流程）：不干预
   if (isDshPage(tab.url)) return; // DSH 自身页面不处理
+  if (tab.id === state.tabId || state.tabs.has(tab.id)) return; // 我们自己控制中的标签不动
   const fromAttached = tab.openerTabId != null && state.attached.has(tab.openerTabId);
-  if (!fromAttached) return; // 非本页弹出：不干预（用户自己的标签）
-  // 从当前控制标签弹出的新标签：关闭它，焦点自然回到原标签，AI 继续在原标签操作
+  const blankPopup = isBlankUrl(tab.url) && (Date.now() - state.lastModelOpAt) < 1200;
+  if (!fromAttached && !blankPopup) return; // 非本页弹出/非模型操作触发的空白页：不干预
+  // 关闭它，焦点自然回到原标签，AI 继续在原标签操作
   try { chrome.tabs.remove(tab.id); } catch { /* ignore */ }
   // 若原标签因新标签弹出而失去焦点，确保仍被控制（无需切 attach，attach 按 tabId 保持）
 });
@@ -773,7 +798,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       try {
         let tabId = state.tabId;
         if (tabId == null) {
-          const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+          state.creatingOwn = true;
+          let tab;
+          try {
+            tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+          } finally {
+            state.creatingOwn = false;
+          }
           tabId = tab.id;
           state.tabs.set(tabId, { url: '', title: '' });
           state.tabId = tabId;
