@@ -82,6 +82,8 @@ window.__ModuleLoader__.load({
         const lastSeq = React.useRef(-1);
         // 用户手动收起标记：手动收起后，帧更新不再自动展开（避免「缩回去又冒出来」）
         const userCollapsed = React.useRef(false);
+        // 是否曾因浏览器活动出现过：初始（从未出现）时完全隐藏；出现后收起为小横幅
+        const shownRef = React.useRef(false);
 
         React.useEffect(() => {
           const timer = window.setInterval(async () => {
@@ -95,13 +97,16 @@ window.__ModuleLoader__.load({
                 if (wasStopped && nowActive) {
                   // 新一轮启动（stopped → running/starting/degraded）：清除手动收起标记并出现+展开
                   userCollapsed.current = false;
+                  shownRef.current = true;
                   setExpanded(true);
                 } else if (!wasStopped && nowStopped) {
-                  // 浏览器停止：恢复隐藏（不置 userCollapsed，下次启动仍会再现）
+                  // 浏览器停止：恢复初始隐藏（不置 userCollapsed，下次启动仍会再现）
+                  shownRef.current = false;
                   setExpanded(false);
                 } else if (r.seq > lastSeq.current && r.seq >= 0 && !userCollapsed.current) {
                   // 仅当用户未手动收起时才随新帧自动展开
                   lastSeq.current = r.seq;
+                  shownRef.current = true;
                   setExpanded(true);
                 }
                 return next;
@@ -229,24 +234,25 @@ window.__ModuleLoader__.load({
           (st.state === 'degraded' ? '  ·  扩展离线：请在 Edge 打开扩展并 attach（专用窗口勿最小化）' : '') +
           (st.lastError ? '  ·  ' + st.lastError : '');
 
-        // 默认收起并隐藏：未展开时不渲染任何内容（初始隐藏；浏览器活动时自动出现）
-        if (!expanded) return null;
+        // 初始（从未因活动出现）时完全隐藏；出现后收起为小横幅（仅头栏，可点击再展开）
+        if (!expanded && !shownRef.current) return null;
 
         return el('div', { className: 'dshbib-card' },
           head,
-          el('div', {},
+          expanded ? el('div', {},
             (st.tabs || []).length > 1 ? el('div', { className: 'dshbib-tabs' }, ...tabEls) : null,
             bar,
             body,
             codeArea,
             el('div', { className: 'dshbib-foot' }, footText),
-          ),
+          ) : null,
         );
       }
 
       // 会话内常驻浏览器窗口：composer 上方全宽行（不随聊天滚动，保留对话/轨迹视图切换）
-      // 默认收起并隐藏：初始不渲染，浏览器开始活动（stopped→running 或新帧）才出现并展开；
-      // 手动收起后彻底隐藏，直到下一次重新启动浏览器才再现。
+      // 初始（从未出现）完全隐藏；浏览器开始活动（stopped→running 或新帧）才出现并展开；
+      // 手动收起后变成小横幅（仅头栏，可点击再展开），新帧不会把它重新撑开；
+      // 浏览器停止后恢复初始隐藏。
       // 宽度精确对齐输入框卡片：输入框卡片外层有左右各 16px 留白，
       // 故卡片实际宽 = min(容器-32, --dsh-composer-card-max-width)。dock 行无该留白，
       // 窗口宽 = min(容器-32, 卡片maxWidth) 才能与输入框完全对齐。
