@@ -339,7 +339,8 @@ export default {
     }
 
     // ---------------- 工具注册（静态插件：defineTool + ctx.tools.register） ----------------
-    // render：GUI 工具卡片的人类可读摘要；模型侧仍通过 execute 返回值拿到完整 JSON（含截图 base64）。
+    // render：GUI 工具卡片的人类可读摘要；同一文本也是模型可见的工具结果，
+    // 因此必须同时携带模型需要的结构化数据（AX 树 ref、tabId、eval 值）。
     function shortText(s, n) {
       s = String(s == null ? '' : s);
       const m = n || 400;
@@ -350,6 +351,16 @@ export default {
         return '✗ ' + (value.error.code ? value.error.code + ': ' : '') + (value.error.message || '');
       }
       return '✗ 操作失败';
+    }
+    function treeSection(value, maxNodes) {
+      const tree = value && value.tree;
+      if (!tree || !Array.isArray(tree.nodes) || tree.nodes.length === 0) return '';
+      const cap = maxNodes || 40;
+      const lines = tree.nodes.slice(0, cap).map((n) =>
+        '[' + (n.ref || '?') + '] ' + (n.role || '') + (n.name ? ' "' + n.name + '"' : '') +
+        ' @(' + n.x + ',' + n.y + ') ' + n.w + 'x' + n.h);
+      const more = tree.nodes.length > cap ? '\n… 共 ' + tree.nodes.length + ' 个节点' : '';
+      return '\n树(rev ' + (tree.rev || '?') + '):\n' + lines.join('\n') + more;
     }
     function registerTool(name, description, params, handler, render) {
       const tool = defineTool({
@@ -371,7 +382,7 @@ export default {
             } else {
               text = JSON.stringify(value && value.result !== undefined ? value.result : value);
             }
-            return [{ type: 'text', text: shortText(text) }];
+            return [{ type: 'text', text: shortText(text, 3000) }];
           },
         },
         async execute(args, exec) {
@@ -438,21 +449,21 @@ export default {
     }, (args, value) => {
       const r = value.result || {};
       const n = value.tree && value.tree.nodes ? value.tree.nodes.length : null;
-      return '✓ 已打开 ' + (r.url || args.url) + (r.tabId ? ' (tab ' + r.tabId + ')' : '') + (n != null ? ' · 感知 ' + n + ' 个节点' : '');
+      return '✓ 已打开 ' + (r.url || args.url) + (r.tabId ? ' (tab ' + r.tabId + ')' : '') + (n != null ? ' · 感知 ' + n + ' 个节点' : '') + treeSection(value);
     });
 
     registerTool('browser_navigate', '在激活标签页导航到 url 并等待加载完成。', {
       url: { type: 'string', description: '目标 URL' },
     }, (args, exec) => runAction(exec, 'navigate', { url: args.url }, { timeout: 20000 }),
-      (args) => '✓ 已导航到 ' + args.url);
+      (args, value) => '✓ 已导航到 ' + args.url + treeSection(value));
 
     registerTool('browser_go', '激活标签页历史前进或后退。', {
       direction: { type: 'string', enum: ['back', 'forward'], description: '方向' },
     }, (args, exec) => runAction(exec, 'go', { direction: args.direction }),
-      (args) => '✓ 已' + (args.direction === 'back' ? '返回上一页' : '前进到下一页'));
+      (args, value) => '✓ 已' + (args.direction === 'back' ? '返回上一页' : '前进到下一页') + treeSection(value));
 
     registerTool('browser_reload', '刷新激活标签页。', {}, (args, exec) => runAction(exec, 'reload', {}),
-      () => '✓ 已刷新当前页面');
+      (args, value) => '✓ 已刷新当前页面' + treeSection(value));
 
     registerTool('browser_click', '在激活标签页点击。优先用 ref（来自 browser_* 返回的树节点 ref 字段，自动滚动到元素并点中心）；无 ref 时按视口 CSS 坐标点击。', {
       ref: { type: 'string', description: '树节点 ref（可选，优先）' },
@@ -464,19 +475,19 @@ export default {
     }, (args, value) => {
       const near = value.tree && value.tree.near ? value.tree.near.length : null;
       const at = args.ref ? 'ref=' + args.ref : '(' + args.x + ', ' + args.y + ')';
-      return '✓ 已点击 ' + at + (near != null ? ' · 附近节点 ' + near + ' 个' : '');
+      return '✓ 已点击 ' + at + (near != null ? ' · 附近节点 ' + near + ' 个' : '') + treeSection(value);
     });
 
     registerTool('browser_type', '在激活标签页输入文本（绕过 IME，中文可用；末尾换行触发回车）。', {
       text: { type: 'string', description: '要输入的文本' },
     }, (args, exec) => runAction(exec, 'type', { text: args.text }),
-      (args) => '✓ 已输入: ' + shortText(String(args.text || '').replace(/\n/g, '⏎'), 60));
+      (args, value) => '✓ 已输入: ' + shortText(String(args.text || '').replace(/\n/g, '⏎'), 60) + treeSection(value));
 
     registerTool('browser_scroll', '在激活标签页滚动（先移动到 x,y 再滚 dx,dy）。', {
       x: { type: 'number' }, y: { type: 'number' },
       dx: { type: 'number', description: '水平滚动量' }, dy: { type: 'number', description: '垂直滚动量' },
     }, (args, exec) => runAction(exec, 'scroll', { x: args.x, y: args.y, dx: args.dx, dy: args.dy }),
-      (args) => '✓ 已滚动 dx=' + (args.dx || 0) + ' dy=' + (args.dy || 0));
+      (args, value) => '✓ 已滚动 dx=' + (args.dx || 0) + ' dy=' + (args.dy || 0) + treeSection(value));
 
     registerTool('browser_screenshot', '返回激活标签页当前帧 dataURL（base64 JPEG）与内在尺寸。', {}, async () => {
       try {
@@ -523,7 +534,7 @@ export default {
       (args, value) => {
         const r = value.result || {};
         const v = r.value;
-        return '✓ ' + shortText(typeof v === 'string' ? v : JSON.stringify(v), 200);
+        return '✓ ' + shortText(typeof v === 'string' ? v : JSON.stringify(v), 2000);
       });
 
     registerTool('browser_tabs', '列出全部标签（tabId、url、title、是否激活）。', {}, async (args, exec) => {
@@ -537,8 +548,8 @@ export default {
       return { ok: true, result: { tabs: state.tabs }, tree: (await buildTree(exec)).tree };
     }, (args, value) => {
       const r = value.result || {};
-      const tabs = (r.tabs || []).map((t) => (t.active ? '▶' : '') + (t.title || t.url || ('tab ' + t.tabId)));
-      return '标签 ' + (r.tabs || []).length + ' 个: ' + shortText(tabs.join(', '), 200);
+      const tabs = (r.tabs || []).map((t) => (t.active ? '▶' : '') + 'tabId=' + t.tabId + ' ' + (t.title || t.url || '(无标题)'));
+      return '标签 ' + (r.tabs || []).length + ' 个:\n' + tabs.join('\n') + treeSection(value);
     });
 
     registerTool('browser_switch', '切换激活标签页（单激活模型：帧流/树/操作只针对激活标签）。', {
@@ -547,7 +558,7 @@ export default {
       const res = await runAction(exec, 'switch', { tabId: args.tabId });
       await syncTabs();
       return res;
-    }, (args) => '✓ 已切换到 tab ' + args.tabId);
+    }, (args, value) => '✓ 已切换到 tab ' + args.tabId + treeSection(value));
 
     registerTool('browser_activate', '把激活标签页带到前台并聚焦 Edge 窗口（供人直接操作真实页面）。', {}, (args, exec) => runAction(exec, 'activate', {}),
       () => '✓ 已把 Edge 窗口带到前台（人可直接操作）');
