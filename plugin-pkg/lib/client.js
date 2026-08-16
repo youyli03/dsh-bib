@@ -10,8 +10,8 @@ window.__ModuleLoader__.load({
     var React = require("react");
 
     const DOCK_CSS = `
-.dshbib-card { box-sizing: border-box; border: 1px solid var(--dsw-alias-border-l2-darkmode-thin, #3f3f46); border-radius: 22px; overflow: hidden; font-size: 12px; line-height: 1.4; background: var(--dsw-specific-input-major, #18181b); color: var(--dsw-alias-label-primary, #e4e4e7); box-shadow: var(--dsw-shadow-lv2, none); }
-.dshbib-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--dsw-alias-separator-primary, #3f3f46); cursor: pointer; background: transparent; }
+.dshbib-card { box-sizing: border-box; border: 1px solid var(--dsw-alias-border-l1, #3f3f46); border-radius: 12px; overflow: hidden; font-size: 12px; line-height: 1.4; background: var(--dsw-specific-tip, #18181b); color: var(--dsw-alias-label-primary, #e4e4e7); box-shadow: var(--dsw-shadow-lv2, none); }
+.dshbib-head { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--dsw-alias-separator-primary, #3f3f46); cursor: pointer; background: transparent; }
 .dshbib-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dsw-alias-label-tertiary, #71717a); flex: none; }
 .dshbib-dot.stopped { background: var(--dsw-alias-label-tertiary, #71717a); }
 .dshbib-dot.starting { background: var(--dsw-alias-state-warn-primary, #facc15); animation: dshbib-blink 0.8s infinite; }
@@ -35,20 +35,21 @@ window.__ModuleLoader__.load({
 .dshbib-error { color: var(--dsw-alias-state-error-primary, #f87171); }
 `;
 
-    /** Host RPC：同源 fetch 到 /dsh-bib/<name>?<query>，返回 JSON。 */
-    async function rpc(name, params) {
-      let qs = '';
-      if (params) {
+    /** Host RPC：同源 fetch 到 /dsh-bib/<name>?<query>，返回 JSON。自动携带当前会话 sessionId。 */
+    function makeRpc(sessionId) {
+      return async function rpc(name, params) {
+        let qs = '';
+        const all = Object.assign({}, params || {}, { sessionId: sessionId || '' });
         const sp = new URLSearchParams();
-        for (const k of Object.keys(params)) {
-          const v = params[k];
+        for (const k of Object.keys(all)) {
+          const v = all[k];
           if (v !== undefined && v !== null) sp.set(k, String(v));
         }
         qs = '?' + sp.toString();
-      }
-      const res = await fetch('/dsh-bib/' + name + qs, { headers: { Accept: 'application/json' } });
-      if (!res.ok) throw new Error('bib/' + name + ' HTTP ' + res.status);
-      return res.json();
+        const res = await fetch('/dsh-bib/' + name + qs, { headers: { Accept: 'application/json' } });
+        if (!res.ok) throw new Error('bib/' + name + ' HTTP ' + res.status);
+        return res.json();
+      };
     }
 
     const inject = ["slots"];
@@ -84,11 +85,49 @@ window.__ModuleLoader__.load({
         const userCollapsed = React.useRef(false);
         // 是否曾因浏览器活动出现过：初始（从未出现）时完全隐藏；出现后收起为小横幅
         const shownRef = React.useRef(false);
+        // 轨迹视图隐藏：切到轨迹/瀑布视图时整个窗口不渲染（含已展开状态），回对话视图恢复
+        const [trajectory, setTrajectory] = React.useState(false);
+        // 会话绑定的 rpc（注入 sessionId）
+        const rpcRef = React.useRef(null);
+        if (!rpcRef.current) rpcRef.current = makeRpc(props.sessionId || '');
+
+        // 轨迹视图感知：切到轨迹/瀑布视图时隐藏窗口（回对话视图恢复）。
+        // 检测当前 view tab：对话视图 tab 有 wSkVaW_tabActive（或 aria-selected=true）
+        // 且文本为「轨迹/瀑布/trajectory/waterfall」。class 检测优先（布局稳定），
+        // aria 兜底；两者都失败则用 view 区域内的活跃 tab 文本。
+        React.useEffect(() => {
+          const detect = () => {
+            try {
+              const isTraj = (t) => {
+                const cls = (t.className || '') + '';
+                const text = (t.textContent || '').trim();
+                const activeByClass = cls.includes('tabActive') || t.getAttribute('aria-selected') === 'true';
+                return activeByClass && /轨迹|瀑布|trajectory|waterfall/i.test(text);
+              };
+              // 优先：header 的 view tab 行（.wSkVaW_tabs 内）
+              let tabs = Array.prototype.slice.call(document.querySelectorAll('.wSkVaW_tab'));
+              if (tabs.some(isTraj)) { setTrajectory(true); return; }
+              // 兜底：会话区域内 aria-selected=true 的 tab
+              const viewArea = document.querySelector('[data-slot="conversation.session"], [data-slot="conversation\\.session"]');
+              if (viewArea) {
+                const at = viewArea.querySelector('[aria-selected="true"]');
+                if (at && /轨迹|瀑布|trajectory|waterfall/i.test((at.textContent || '').trim())) {
+                  setTrajectory(true);
+                  return;
+                }
+              }
+              setTrajectory(false);
+            } catch { /* ignore */ }
+          };
+          detect();
+          const t = window.setInterval(detect, 800);
+          return () => window.clearInterval(t);
+        }, []);
 
         React.useEffect(() => {
           const timer = window.setInterval(async () => {
             try {
-              const r = await rpc('poll', {});
+              const r = await rpcRef.current('poll', {});
               setSt((prev) => {
                 const next = Object.assign({}, prev, r);
                 const wasStopped = prev.state === 'stopped';
@@ -139,13 +178,13 @@ window.__ModuleLoader__.load({
 
         function onViewportClick(e) {
           const p = viewportPoint(e);
-          rpc('input', { type: 'click', x: Math.round(p.x), y: Math.round(p.y) }).catch(() => {});
+          rpcRef.current('input', { type: 'click', x: Math.round(p.x), y: Math.round(p.y) }).catch(() => {});
         }
 
         function onViewportWheel(e) {
           try { e.preventDefault(); } catch { /* ignore */ }
           const p = viewportPoint(e);
-          rpc('input', {
+          rpcRef.current('input', {
             type: 'scroll', x: Math.round(p.x), y: Math.round(p.y),
             dx: Math.round(e.deltaX), dy: Math.round(e.deltaY),
           }).catch(() => {});
@@ -155,16 +194,16 @@ window.__ModuleLoader__.load({
           let u = urlInput.trim();
           if (!u) return;
           if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) u = 'https://' + u;
-          rpc('navigate', { url: u }).catch(() => {});
+          rpcRef.current('navigate', { url: u }).catch(() => {});
         }
 
-        function switchTab(tabId) { rpc('switch', { tabId }).catch(() => {}); }
-        function activateEdge() { rpc('activate', {}).catch(() => {}); }
+        function switchTab(tabId) { rpcRef.current('switch', { tabId }).catch(() => {}); }
+        function activateEdge() { rpcRef.current('activate', {}).catch(() => {}); }
         const [confirmStop, setConfirmStop] = React.useState(false);
         function stopAll() {
           if (!confirmStop) { setConfirmStop(true); return; }
           setConfirmStop(false);
-          rpc('stop', {}).catch(() => {});
+          rpcRef.current('stop', {}).catch(() => {});
         }
 
         const dot = el('span', { className: 'dshbib-dot ' + st.state });
@@ -195,9 +234,9 @@ window.__ModuleLoader__.load({
           }, (t.title || t.url || ('tab ' + t.tabId)).slice(0, 20)));
 
         const bar = el('div', { className: 'dshbib-bar' },
-          el('button', { className: 'dshbib-btn', onClick: () => rpc('navigate', { action: 'go', direction: 'back' }).catch(() => {}) }, '◀'),
-          el('button', { className: 'dshbib-btn', onClick: () => rpc('navigate', { action: 'go', direction: 'forward' }).catch(() => {}) }, '▶'),
-          el('button', { className: 'dshbib-btn', onClick: () => rpc('navigate', { action: 'reload' }).catch(() => {}) }, '⟳'),
+          el('button', { className: 'dshbib-btn', onClick: () => rpcRef.current('navigate', { action: 'go', direction: 'back' }).catch(() => {}) }, '◀'),
+          el('button', { className: 'dshbib-btn', onClick: () => rpcRef.current('navigate', { action: 'go', direction: 'forward' }).catch(() => {}) }, '▶'),
+          el('button', { className: 'dshbib-btn', onClick: () => rpcRef.current('navigate', { action: 'reload' }).catch(() => {}) }, '⟳'),
           el('input', {
             className: 'dshbib-url', value: urlInput, placeholder: st.url || 'https://…',
             onChange: (e) => setUrlInput(e.target.value),
@@ -234,6 +273,9 @@ window.__ModuleLoader__.load({
           (st.state === 'degraded' ? '  ·  扩展离线：请在 Edge 打开扩展并 attach（专用窗口勿最小化）' : '') +
           (st.lastError ? '  ·  ' + st.lastError : '');
 
+        // 轨迹视图隐藏：切到轨迹/瀑布视图时整个窗口不渲染（含已展开状态），回对话视图恢复
+        if (trajectory) return null;
+
         // 初始（从未因活动出现）时完全隐藏；出现后收起为小横幅（仅头栏，可点击再展开）
         if (!expanded && !shownRef.current) return null;
 
@@ -253,18 +295,24 @@ window.__ModuleLoader__.load({
       // 初始（从未出现）完全隐藏；浏览器开始活动（stopped→running 或新帧）才出现并展开；
       // 手动收起后变成小横幅（仅头栏，可点击再展开），新帧不会把它重新撑开；
       // 浏览器停止后恢复初始隐藏。
-      // 宽度精确对齐输入框卡片：输入框卡片外层有左右各 16px 留白，
-      // 故卡片实际宽 = min(容器-32, --dsh-composer-card-max-width)。dock 行无该留白，
-      // 窗口宽 = min(容器-32, 卡片maxWidth) 才能与输入框完全对齐。
+      // 尺寸对齐任务条（TodoPanel .lXshSW_root 同规范）：
+      //   border-radius:12px / border:1px solid border-l1 / background: dsw-specific-tip
+      //   width: calc(100% - 2*side-clearance - 4*dock-inset)（= calc(100% - 64px)）
+      //   max-width: calc(card-max-width - 4*dock-inset)（= 748px） margin: 0 auto
+      // 会话绑定：slot ownerProps 注入 sessionId，rpc 带该 id 走 Host 会话隔离状态。
       ctx.slots.inject('conversation.input.dock', () => ctx.slots.register(
         { name: 'conversation.input.dock', id: 'dshbib-window', order: 0 },
-        () => el('div', {
-          style: {
-            width: 'calc(100% - 32px)',
-            maxWidth: 'var(--dsh-composer-card-max-width)',
-            margin: '0 auto',
-          },
-        }, el(BibCard)),
+        (props) => {
+          const sid = (props && props.sessionId) || (props && props.session && props.session.id) || '';
+          return el('div', {
+            style: {
+              boxSizing: 'border-box',
+              width: 'calc(100% - 2 * var(--dsh-composer-side-clearance, 16px) - 4 * var(--dsh-composer-dock-inset, 8px))',
+              maxWidth: 'calc(var(--dsh-composer-card-max-width, 780px) - 4 * var(--dsh-composer-dock-inset, 8px))',
+              margin: '0 auto',
+            },
+          }, el(BibCard, { sessionId: sid }));
+        },
       ));
     }
 

@@ -54,6 +54,19 @@
 - **对话记录卡片**（`tool.view.cordis`）：对话流内折叠标题条，可展开看视口。
 - 人工操作：卡片/窗口内点击、滚轮、URL 导航；「切到 Edge」跳真实标签页。
 - 主题跟随：全部使用 `--dsw-alias-*` 真实主题 token。
+- **尺寸对齐任务条**（TodoPanel `.lXshSW_root` 同规范）：`border-radius:12px`、`border:1px solid var(--dsw-alias-border-l1)`、`background:var(--dsw-specific-tip)`、`width:calc(100% - 2×side-clearance - 4×dock-inset)`、`max-width:calc(card-max-width - 4×dock-inset)`、`margin:0 auto`。
+
+### 1.7 多会话隔离（v2 新增）
+
+- **窗口绑定当前会话**：`conversation.input.dock` 为 session scope（每会话独立窗口实例），Client 从 slot ownerProps 注入 `sessionId`，所有 `/dsh-bib/*` RPC 携带 `sessionId`。
+- **Host 按会话隔离状态**：`Map<sessionId, SessionState>`，每会话独立持有 `{activeTabId, frame, rev, lastTreeHash, lastClick, tabs, url, title}`；桥（bridge）全局单例（一个 node 子进程 + 一个扩展连接，天然支持多标签）。
+- **每会话专属标签**：会话首次 `browser_open` 新建专属标签并绑定，之后复用；命令经 `sessionCommand` 自动携带该会话 `activeTabId` 精确路由 —— 会话 A/B 各操作各的标签，帧/树/rev 互不覆盖。
+- **多会话并发**：命令 FIFO 串行 + 按 tabId 路由；帧缓存按会话隔离，周期截帧只更新有激活标签的会话。
+
+### 1.8 轨迹视图隐藏（v2 新增）
+
+- 切到「轨迹/瀑布」视图时浏览器窗口整个隐藏（含已展开状态），回「对话」视图恢复。
+- 检测：view tab `.wSkVaW_tab` 中 `tabActive`（或 `aria-selected=true`）+ 文本匹配 `轨迹|瀑布|trajectory|waterfall`，class 优先、aria 兜底，800ms 轮询。
 
 ### 1.5 自动发现与保活（已实现）
 
