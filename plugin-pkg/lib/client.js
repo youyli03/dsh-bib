@@ -76,7 +76,7 @@ window.__ModuleLoader__.load({
           width: 0, height: 0, tabs: [], activeTab: null,
           code: null, lastError: '',
         });
-        const [expanded, setExpanded] = React.useState(!!(props && props.initialExpanded));
+        const [expanded, setExpanded] = React.useState(false);
         const [showCode, setShowCode] = React.useState(false);
         const [urlInput, setUrlInput] = React.useState('');
         const lastSeq = React.useRef(-1);
@@ -89,8 +89,14 @@ window.__ModuleLoader__.load({
               const r = await rpc('poll', {});
               setSt((prev) => {
                 const next = Object.assign({}, prev, r);
-                // 仅当用户未手动收起时才随新帧自动展开
-                if (r.seq > lastSeq.current && r.seq >= 0 && !userCollapsed.current) {
+                const wasStopped = prev.state === 'stopped';
+                const nowActive = r.state === 'running' || r.state === 'starting' || r.state === 'degraded';
+                if (wasStopped && nowActive) {
+                  // 新一轮启动（stopped → running/starting/degraded）：清除手动收起标记并出现+展开
+                  userCollapsed.current = false;
+                  setExpanded(true);
+                } else if (r.seq > lastSeq.current && r.seq >= 0 && !userCollapsed.current) {
+                  // 仅当用户未手动收起时才随新帧自动展开
                   lastSeq.current = r.seq;
                   setExpanded(true);
                 }
@@ -219,19 +225,24 @@ window.__ModuleLoader__.load({
           (st.state === 'degraded' ? '  ·  扩展离线：请在 Edge 打开扩展并 attach（专用窗口勿最小化）' : '') +
           (st.lastError ? '  ·  ' + st.lastError : '');
 
+        // 默认收起并隐藏：未展开时不渲染任何内容（初始隐藏；浏览器活动时自动出现）
+        if (!expanded) return null;
+
         return el('div', { className: 'dshbib-card' },
           head,
-          expanded ? el('div', {},
+          el('div', {},
             (st.tabs || []).length > 1 ? el('div', { className: 'dshbib-tabs' }, ...tabEls) : null,
             bar,
             body,
             codeArea,
             el('div', { className: 'dshbib-foot' }, footText),
-          ) : null,
+          ),
         );
       }
 
       // 会话内常驻浏览器窗口：composer 上方全宽行（不随聊天滚动，保留对话/轨迹视图切换）
+      // 默认收起并隐藏：初始不渲染，浏览器开始活动（stopped→running 或新帧）才出现并展开；
+      // 手动收起后彻底隐藏，直到下一次重新启动浏览器才再现。
       // 宽度精确对齐输入框卡片：输入框卡片外层有左右各 16px 留白，
       // 故卡片实际宽 = min(容器-32, --dsh-composer-card-max-width)。dock 行无该留白，
       // 窗口宽 = min(容器-32, 卡片maxWidth) 才能与输入框完全对齐。
@@ -243,7 +254,7 @@ window.__ModuleLoader__.load({
             maxWidth: 'var(--dsh-composer-card-max-width)',
             margin: '0 auto',
           },
-        }, el(BibCard, { initialExpanded: true })),
+        }, el(BibCard)),
       ));
     }
 
