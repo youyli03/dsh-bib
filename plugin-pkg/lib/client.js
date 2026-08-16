@@ -91,10 +91,14 @@ window.__ModuleLoader__.load({
                 const next = Object.assign({}, prev, r);
                 const wasStopped = prev.state === 'stopped';
                 const nowActive = r.state === 'running' || r.state === 'starting' || r.state === 'degraded';
+                const nowStopped = r.state === 'stopped';
                 if (wasStopped && nowActive) {
                   // 新一轮启动（stopped → running/starting/degraded）：清除手动收起标记并出现+展开
                   userCollapsed.current = false;
                   setExpanded(true);
+                } else if (!wasStopped && nowStopped) {
+                  // 浏览器停止：恢复隐藏（不置 userCollapsed，下次启动仍会再现）
+                  setExpanded(false);
                 } else if (r.seq > lastSeq.current && r.seq >= 0 && !userCollapsed.current) {
                   // 仅当用户未手动收起时才随新帧自动展开
                   lastSeq.current = r.seq;
