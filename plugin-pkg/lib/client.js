@@ -95,6 +95,23 @@ window.__ModuleLoader__.load({
       }
 
       function BibCard(props) {
+        const sid = props.sessionId || '';
+        // UI 折叠状态按会话持久化（切会话再切回不丢手动收起/隐藏状态）
+        const storeKey = 'dshbib:ui:' + sid;
+        function readStored() {
+          try {
+            const raw = window.localStorage.getItem(storeKey);
+            return raw ? JSON.parse(raw) : null;
+          } catch { return null; }
+        }
+        function writeStored(patch) {
+          try {
+            const cur = readStored() || {};
+            window.localStorage.setItem(storeKey, JSON.stringify(Object.assign(cur, patch)));
+          } catch { /* ignore */ }
+        }
+        const stored = readStored();
+
         const [st, setSt] = React.useState({
           state: 'stopped', url: '', title: '', seq: -1, data: '',
           width: 0, height: 0, tabs: [], activeTab: null,
@@ -105,14 +122,14 @@ window.__ModuleLoader__.load({
         const [urlInput, setUrlInput] = React.useState('');
         const lastSeq = React.useRef(-1);
         // 用户手动收起标记：手动收起后，帧更新不再自动展开（避免「缩回去又冒出来」）
-        const userCollapsed = React.useRef(false);
+        const userCollapsed = React.useRef(!!(stored && stored.userCollapsed));
         // 是否曾因浏览器活动出现过：初始（从未出现）时完全隐藏；出现后收起为小横幅
-        const shownRef = React.useRef(false);
+        const shownRef = React.useRef(!!(stored && stored.shown));
         // 轨迹视图隐藏：切到轨迹/瀑布视图时整个窗口不渲染（含已展开状态），回对话视图恢复
         const [trajectory, setTrajectory] = React.useState(false);
         // 会话绑定的 rpc（注入 sessionId）
         const rpcRef = React.useRef(null);
-        if (!rpcRef.current) rpcRef.current = makeRpc(props.sessionId || '');
+        if (!rpcRef.current) rpcRef.current = makeRpc(sid);
 
         // 轨迹视图感知：切到轨迹/瀑布视图时隐藏窗口（回对话视图恢复）。
         // 检测当前 view tab：对话视图 tab 有 wSkVaW_tabActive（或 aria-selected=true）
@@ -159,16 +176,20 @@ window.__ModuleLoader__.load({
                 if (wasStopped && nowActive) {
                   // 新一轮启动（stopped → running/starting/degraded）：清除手动收起标记并出现+展开
                   userCollapsed.current = false;
+                  writeStored({ userCollapsed: false });
                   shownRef.current = true;
+                  writeStored({ shown: true });
                   setExpanded(true);
                 } else if (!wasStopped && nowStopped) {
                   // 浏览器停止：恢复初始隐藏（不置 userCollapsed，下次启动仍会再现）
                   shownRef.current = false;
+                  writeStored({ shown: false });
                   setExpanded(false);
                 } else if (r.seq > lastSeq.current && r.seq >= 0 && !userCollapsed.current) {
                   // 仅当用户未手动收起时才随新帧自动展开
                   lastSeq.current = r.seq;
                   shownRef.current = true;
+                  writeStored({ shown: true });
                   setExpanded(true);
                 }
                 return next;
@@ -226,18 +247,25 @@ window.__ModuleLoader__.load({
         function stopAll() {
           if (!confirmStop) { setConfirmStop(true); return; }
           setConfirmStop(false);
+          // 完全关闭：清空该会话的显示/收起持久化，窗口彻底隐藏
+          try { window.localStorage.removeItem(storeKey); } catch { /* ignore */ }
+          userCollapsed.current = false;
+          shownRef.current = false;
+          setExpanded(false);
           rpcRef.current('stop', {}).catch(() => {});
         }
 
         const dot = el('span', { className: 'dshbib-dot ' + st.state });
         const head = el('div', { className: 'dshbib-head', onClick: () => {
           if (expanded) {
-            // 收起：记录用户手动收起，帧更新不再自动展开
+            // 收起：记录用户手动收起，帧更新不再自动展开（持久化，切会话回来仍保持）
             userCollapsed.current = true;
+            writeStored({ userCollapsed: true });
             setExpanded(false);
           } else {
             // 展开：清除收起标记，恢复随帧自动展开
             userCollapsed.current = false;
+            writeStored({ userCollapsed: false });
             setExpanded(true);
           }
         } },
