@@ -174,12 +174,14 @@ window.__ModuleLoader__.load({
                 const nowActive = r.state === 'running' || r.state === 'starting' || r.state === 'degraded';
                 const nowStopped = r.state === 'stopped';
                 if (wasStopped && nowActive) {
-                  // 新一轮启动（stopped → running/starting/degraded）：清除手动收起标记并出现+展开
-                  userCollapsed.current = false;
-                  writeStored({ userCollapsed: false });
+                  // 状态从 stopped → running：若用户此前手动收起过（含跨会话持久化恢复），
+                  // 保持横幅不展开 —— 组件重挂载后 initial state 就是 stopped 会走到这里，
+                  // 不能把它当成「新一轮启动」而强制展开。仅真正未收起时才出现+展开。
                   shownRef.current = true;
                   writeStored({ shown: true });
-                  setExpanded(true);
+                  if (!userCollapsed.current) {
+                    setExpanded(true);
+                  }
                 } else if (!wasStopped && nowStopped) {
                   // 浏览器停止：恢复初始隐藏（不置 userCollapsed，下次启动仍会再现）
                   shownRef.current = false;
