@@ -65,11 +65,28 @@ return {
       state.token = genToken();
       state.status = 'starting';
       state.lastError = '';
-      bridge = subprocess.spawn({
-        argv: ['node', '-e', BRIDGE_CODE],
-        stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'inherit' },
-        graceMs: 1000,
-      });
+      // cwd is mandatory: DSH validates spec.cwd unconditionally
+      // (targetEnvironment -> validateNoNullByte), so an omitted cwd throws a
+      // synchronous TypeError that used to wedge this state machine in
+      // 'starting' forever. The bridge runs from inline `-e` code, so the
+      // server's own working directory is a safe anchor.
+      const cwd = (typeof process !== 'undefined' && process.cwd) ? process.cwd() : '.';
+      try {
+        bridge = subprocess.spawn({
+          argv: ['node', '-e', BRIDGE_CODE],
+          cwd,
+          stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'inherit' },
+          graceMs: 1000,
+        });
+      } catch (e) {
+        // A synchronous spawn failure must not leave 'starting' without a live
+        // handle: record it and leave the state restartable.
+        bridge = null;
+        state.status = 'error';
+        state.lastError = '桥 spawn 失败: ' + String((e && e.message) || e);
+        emitStatus();
+        throw Object.assign(new Error(state.lastError), { code: 'BRIDGE_SPAWN_FAILED' });
+      }
       bridge.stdout.on('data', (c) => {
         outBuf += c.toString();
         let i;
@@ -337,8 +354,17 @@ return {
       if (state.status === 'running') return;
       if (state.status === 'starting' || state.status === 'degraded') {
         const ok = await waitForStatus('running', 5000);
-        if (!ok) throw Object.assign(new Error('浏览器未就绪'), { code: 'NOT_RUNNING' });
-        return;
+        if (ok) return;
+        // 'starting' without a live bridge handle is a wedge (a synchronous
+        // spawn throw leaves both behind): demote it so the start path below
+        // retries instead of failing every tool call until DSH restarts.
+        if (state.status === 'starting' && !bridge) {
+          state.status = 'error';
+          if (!state.lastError) state.lastError = '桥启动超时（未收到 ready）';
+          emitStatus();
+        } else {
+          throw Object.assign(new Error('浏览器未就绪'), { code: 'NOT_RUNNING' });
+        }
       }
       await startBridge();
       const ok = await waitForStatus('running', 5000);
