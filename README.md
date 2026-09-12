@@ -25,6 +25,7 @@
 | AX 树感知 | 每次操作后返回**最新完整**语义树（role + 名称 + 视口坐标 + `ref_N` 稳定引用）；双通道提取：DOM walk 骨架 + CDP `Accessibility` 浏览器权威语义（覆盖 aria/shadow DOM，全站点通用），`data-*` 与无文本链接兜底（Steam 库存卡片类） |
 | ref 点击 | 树节点带 ref，点击时自动滚动到元素并点中心，无需手动算坐标 |
 | 实时画面 | 操作后主动截帧 + 2s 周期刷新，页面自身变化（懒加载/动画）也能跟上 |
+| 截图落盘 | `browser_screenshot(saveTo="绝对路径")` 把截图写成文件并返回路径 —— 模型才能用 `read_image` / `modlens` 真正"看图"（工具结果里的 dataURL 文本是看不见的）；`fullPage=true` 走 CDP 整页 PNG，默认只截视口 JPEG |
 | 单标签锁定 | target=_blank 新标签自动关闭；AI 操作（导航/点击/输入/滚动）全部后台进行，浏览器焦点不被抢 |
 | 自动发现 | 扩展经 DSH Web 路由 `/dsh-bib/bridge-info` 自动发现桥的端口与令牌，免手动配对 |
 | 保活机制 | 页面心跳动画 + chrome.alarms，规避 MV3 Service Worker 30s 空闲限制 |
@@ -87,6 +88,8 @@ browser_click(ref="ref_42")                    # 按树节点 ref 点击（自�
 browser_type(text="关键词\n")                   # 输入文本（支持中文；末尾 \n 回车）
 browser_scroll(dy=400)                         # 滚动
 browser_screenshot()                           # 取当前帧
+browser_screenshot(saveTo="F:\\shots\\a.png")   # 截图落盘 → 返回文件路径，再 read_image 看图
+browser_screenshot(fullPage=true, saveTo="F:\\shots\\")  # 整页 PNG；路径以分隔符结尾自动命名
 browser_eval(expression="...")                 # 执行 JS 取回结果
 ```
 
@@ -121,6 +124,8 @@ dsh-bib/
 - **自定义 JS 下拉组件**：原生 `<select>` 可后台直接设值；依赖 UI 点击的自定义下拉可能需要前台。
 - **桥令牌**：PoC 使用 `Math.random` 生成（Host 沙箱无 CSPRNG builtin），正式部署建议自行加固。
 - **多标签**：单标签锁定模型下，从当前标签弹出的新标签会被自动关闭；若需多标签，模型可显式 `browser_switch` / `browser_open`（会激活目标标签）。
+- **截图落盘不走 `ctx.fs`**：DSH 的 fs seam 只有文本原语（`writeText`，二进制-safe 变更被官方延期），所以 `saveTo` 由桥进程（`bridge.js` 的本地命令 `saveFile`）直接写盘 —— 这意味着**该路径不受会话工作区沙箱限制**。不需要此能力时不用传 `saveTo` 即可。
+- **整页截图需重载扩展**：`fullPage` 依赖扩展的 `Page.captureScreenshot {captureBeyondViewport}` 分支；改过 `extension/` 后要在 `edge://extensions` 点一次「重新加载」，否则仍是旧的视口 JPEG。
 
 ## License
 

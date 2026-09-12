@@ -520,40 +520,60 @@ return {
       dx: { type: 'number', description: '水平滚动量' }, dy: { type: 'number', description: '垂直滚动量' },
     }, (args, exec) => runAction(exec, 'scroll', { x: args.x, y: args.y, dx: args.dx, dy: args.dy }));
 
-    registerTool('browser_screenshot', '返回激活标签页当前帧 dataURL（base64 JPEG）与内在尺寸。', {}, async () => {
+    registerTool('browser_screenshot', '返回激活标签页当前帧 dataURL（base64 JPEG）与内在尺寸。传 saveTo 落盘并返回路径，传 fullPage 整页 PNG。', {
+      saveTo: { type: 'string', description: '可选：保存到该绝对路径（以分隔符结尾视为目录，自动命名）' },
+      fullPage: { type: 'boolean', description: '可选：整页截图（PNG）；默认视口 JPEG' },
+    }, async (args) => {
       try {
         await ensureRunning();
       } catch (e) {
         return errResult('NOT_RUNNING', '浏览器未启动');
       }
-      if (state.frame) {
+      const fullPage = !!args.fullPage;
+      let shot = null;
+      // 只有"看当前画面"才复用帧缓存；整页/落盘必须现拍（缓存里是视口 JPEG）
+      if (!fullPage && !args.saveTo && state.frame) {
+        shot = { data: state.frame.data, width: state.frame.width, height: state.frame.height, seq: state.frame.seq, format: 'jpeg' };
+      } else {
+        try {
+          const r = await sendCommand('screenshot', fullPage ? { fullPage: true, format: 'png' } : {}, fullPage ? 30000 : 10000);
+          if (r && r.data) shot = r;
+        } catch (e) {
+          return errResult('NO_FRAME', '扩展截图失败：' + String((e && e.message) || e) + ' code=' + (e && e.code));
+        }
+      }
+      if (!shot) return errResult('NO_FRAME', '扩展亦无帧');
+      const format = shot.format === 'png' ? 'png' : 'jpeg';
+      if (args.saveTo) {
+        // 落盘由桥的本地命令 saveFile 完成：ctx.fs 只能写文本，二进制图写不了
+        const name = 'bib-' + new Date().toISOString().replace(/[:.]/g, '-') + '.' + (format === 'png' ? 'png' : 'jpg');
+        let saved;
+        try {
+          saved = await sendCommand('saveFile', { path: args.saveTo, name, data: shot.data }, 30000);
+        } catch (e) {
+          return errResult((e && e.code) || 'SAVE_FAILED', '保存失败：' + String((e && e.message) || e));
+        }
         return {
           ok: true,
           result: {
-            data: 'data:image/jpeg;base64,' + state.frame.data,
-            width: state.frame.width,
-            height: state.frame.height,
-            seq: state.frame.seq,
+            path: (saved && saved.path) || args.saveTo,
+            bytes: (saved && saved.bytes) || 0,
+            width: shot.width || 0,
+            height: shot.height || 0,
+            fullPage,
+            format,
           },
         };
       }
-      try {
-        const r = await sendCommand('screenshot', {}, 10000);
-        if (r && r.data) {
-          return {
-            ok: true,
-            result: {
-              data: 'data:image/jpeg;base64,' + r.data,
-              width: r.width || 0,
-              height: r.height || 0,
-              seq: r.seq || 0,
-            },
-          };
-        }
-        return errResult('NO_FRAME', '扩展亦无帧：' + JSON.stringify(r || {}));
-      } catch (e) {
-        return errResult('NO_FRAME', '扩展截图失败：' + String((e && e.message) || e) + ' code=' + (e && e.code));
-      }
+      return {
+        ok: true,
+        result: {
+          data: 'data:image/' + format + ';base64,' + shot.data,
+          width: shot.width || 0,
+          height: shot.height || 0,
+          seq: shot.seq || 0,
+        },
+      };
     });
 
     registerTool('browser_eval', '在激活标签页执行 JS 表达式并返回值（JSON 序列化）。', {

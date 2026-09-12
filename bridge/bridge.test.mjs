@@ -3,6 +3,8 @@
 
 import { spawn } from 'node:child_process';
 import http from 'node:http';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -203,6 +205,35 @@ const tests = [
   ['CORS 响应：GET /ping 带扩展 Origin → ACAO 回声', async () => {
     const r = await httpReq('GET', '/ping', { headers: okHeaders() });
     return r.status === 200 && r.aca === okHeaders().Origin;
+  }],
+  ['本地命令 saveFile：dataURL 落盘 + 返回路径', async () => {
+    const dirTmp = mkdtempSync(path.join(tmpdir(), 'bib-save-'));
+    const target = path.join(dirTmp, 'shot.png');
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const p = waitMsg((x) => (x.type === 'ok' || x.type === 'err') && x.id === 91);
+    sendHostCmd({ id: 91, cmd: 'saveFile', path: target, data: 'data:image/png;base64,' + png.toString('base64') });
+    const m = await p;
+    const written = readFileSync(target);
+    const ok = m.type === 'ok' && m.result.bytes === png.length && written.equals(png)
+      && path.resolve(m.result.path) === path.resolve(target);
+    rmSync(dirTmp, { recursive: true, force: true });
+    return ok;
+  }],
+  ['本地命令 saveFile：缺 data → BAD_DATA', async () => {
+    const p = waitMsg((x) => (x.type === 'ok' || x.type === 'err') && x.id === 92);
+    sendHostCmd({ id: 92, cmd: 'saveFile', path: path.join(tmpdir(), 'bib-none.png') });
+    const m = await p;
+    return m.type === 'err' && m.error.code === 'BAD_DATA';
+  }],
+  ['本地命令 saveFile：path 以分隔符结尾 → 目录 + name', async () => {
+    const dirTmp = mkdtempSync(path.join(tmpdir(), 'bib-save2-'));
+    const p = waitMsg((x) => (x.type === 'ok' || x.type === 'err') && x.id === 93);
+    sendHostCmd({ id: 93, cmd: 'saveFile', path: dirTmp + path.sep, data: Buffer.from('00', 'hex').toString('base64'), name: 'auto.png' });
+    const m = await p;
+    // 桥自己应答（无需扩展轮询）= 该命令未下发；路径按目录语义拼接
+    const ok = m.type === 'ok' && m.result.path === path.join(dirTmp, 'auto.png') && m.result.bytes === 1;
+    rmSync(dirTmp, { recursive: true, force: true });
+    return ok;
   }],
   ['shutdown → exit 0', async () => {
     const p = waitMsg((x) => x.type === 'exit', 3000);

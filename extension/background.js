@@ -572,11 +572,43 @@ async function doTree(tabId) {
   return { ok: true, result: { nodes, source: 'ax+dom' } };
 }
 
-async function doScreenshot(tabId) {
+async function doScreenshot(tabId, opts) {
+  const fullPage = !!(opts && opts.fullPage);
+  // 整页截图（PNG）：captureBeyondViewport + clip 到 cssContentSize。
+  // 关键：整页图不写 state.lastFrame —— 客户端点击坐标换算依赖视口帧，
+  // 用整页图当帧会让点击全部错位（见下方视口分支的注释）。
+  if (fullPage) {
+    try {
+      let width = 0;
+      let height = 0;
+      try {
+        const metrics = await send(tabId, 'Page.getLayoutMetrics');
+        const size = metrics.cssContentSize || metrics.contentSize || {};
+        width = Math.ceil(size.width || 0);
+        height = Math.ceil(size.height || 0);
+      } catch { /* 拿不到内容尺寸 → 退化为裸 captureBeyondViewport */ }
+      const shot = await send(tabId, 'Page.captureScreenshot', Object.assign(
+        { format: 'png', captureBeyondViewport: true },
+        width > 0 && height > 0 ? { clip: { x: 0, y: 0, width, height, scale: 1 } } : {},
+      ));
+      if (shot && shot.data) {
+        return {
+          ok: true,
+          result: {
+            data: shot.data, width, height,
+            seq: Date.now(), fullPage: true, format: 'png',
+          },
+        };
+      }
+    } catch { /* 整页失败 → 回退视口帧 */ }
+  }
   // 实时截帧优先：screencast 在页面静止/后台时被节流，缓存 lastFrame 会永远停留旧画面。
   // captureScreenshot 失败（页面加载中/未就绪）才回退缓存帧。
   try {
-    const shot = await send(tabId, 'Page.captureScreenshot', { format: 'jpeg', quality: 60 });
+    const format = (opts && opts.format === 'png') ? 'png' : 'jpeg';
+    const shot = await send(tabId, 'Page.captureScreenshot', format === 'png'
+      ? { format: 'png' }
+      : { format: 'jpeg', quality: 60 });
     if (shot && shot.data) {
       let width = 0;
       let height = 0;
@@ -593,7 +625,7 @@ async function doScreenshot(tabId) {
         }
       } catch { /* ignore */ }
       state.lastFrame = { data: shot.data, width, height, seq: Date.now() };
-      return { ok: true, result: { data: shot.data, width, height, seq: state.lastFrame.seq } };
+      return { ok: true, result: { data: shot.data, width, height, seq: state.lastFrame.seq, format } };
     }
   } catch { /* 实时截帧失败，回退缓存 */ }
   if (state.lastFrame) {
@@ -727,7 +759,7 @@ async function dispatch(cmd, tabId) {
       return await doTree(tabId);
     case 'screenshot':
       if (tabId == null || !state.attached.has(tabId)) return notAttached();
-      return await doScreenshot(tabId);
+      return await doScreenshot(tabId, { fullPage: cmd.fullPage, format: cmd.format });
     case 'activate':
       if (tabId == null) return notAttached();
       return await doActivate(tabId);

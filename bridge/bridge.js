@@ -1,9 +1,15 @@
 'use strict';
-// dsh-bib 中继桥 —— 扩展(HTTP) ↔ Host(JSONL stdio) 纯转发
+// dsh-bib 中继桥 —— 扩展(HTTP) ↔ Host(JSONL stdio) 转发
 // 协议契约见 docs/bridge-api.md；本文件零第三方依赖。
+//
+// 例外：Host 的 ctx.fs 只支持文本（fs seam 无二进制写入原语），而截图是二进制，
+// 因此 `saveFile` 是桥自己处理的**本地命令**（不下发给扩展）：它把 base64 解码后
+// 直接落盘，让 Host 能返回一个可读的文件路径。与其它命令一样走 {id, cmd} 契约。
 
 const http = require('http');
 const net = require('net');
+const fs = require('fs');
+const path = require('path');
 
 let token = null;
 let server = null;
@@ -251,6 +257,10 @@ function handleHostMessage(msg) {
   }
 
   if (msg && msg.cmd === 'shutdown') { shutdown(0); return; }
+  // 本地命令：解码 base64 落盘（Host 侧 fs 只能写文本，二进制图必须在此写）
+  if (msg && msg.cmd === 'saveFile' && typeof msg.id === 'number') {
+    return handleSaveFile(msg);
+  }
   if (msg && typeof msg.id === 'number' && typeof msg.cmd === 'string') {
     if (cmdQueue.length >= QUEUE_LIMIT) {
       emit({ type: 'err', id: msg.id, error: { code: 'QUEUE_FULL' } });
@@ -258,7 +268,8 @@ function handleHostMessage(msg) {
     }
     const cmd = { id: msg.id, cmd: msg.cmd };
     const keys = ['url', 'tabId', 'x', 'y', 'dx', 'dy', 'text', 'expression',
-      'direction', 'method', 'params', 'refresh_tree', 'title', 'ref'];
+      'direction', 'method', 'params', 'refresh_tree', 'title', 'ref',
+      'fullPage', 'format'];
     for (const k of keys) {
       if (msg[k] !== undefined) cmd[k] = msg[k];
     }
@@ -267,5 +278,41 @@ function handleHostMessage(msg) {
       const w = waiters.shift();
       takeCommand(w.res);
     }
+  }
+}
+
+const SAVE_MAX_BYTES = 32 * 1024 * 1024;
+
+// saveFile: { path, data(base64|dataURL), name? }
+// path 以分隔符结尾时视为目录，用 name（默认 bib-shot.png）拼接。
+function handleSaveFile(msg) {
+  const reply = (body) => {
+    if (body.error) emit({ type: 'err', id: msg.id, error: body.error });
+    else emit({ type: 'ok', id: msg.id, result: body.result });
+  };
+  try {
+    if (typeof msg.path !== 'string' || msg.path.length === 0) {
+      return reply({ error: { code: 'BAD_PATH', message: 'saveFile 缺少 path' } });
+    }
+    if (typeof msg.data !== 'string' || msg.data.length === 0) {
+      return reply({ error: { code: 'BAD_DATA', message: 'saveFile 缺少 data' } });
+    }
+    const b64 = msg.data.replace(/^data:[^;,]+;base64,/, '');
+    const buf = Buffer.from(b64, 'base64');
+    if (buf.length === 0) {
+      return reply({ error: { code: 'BAD_DATA', message: 'base64 解码为空' } });
+    }
+    if (buf.length > SAVE_MAX_BYTES) {
+      return reply({ error: { code: 'TOO_LARGE', message: '图片超过 ' + SAVE_MAX_BYTES + ' 字节' } });
+    }
+    let abs = path.resolve(msg.path);
+    if (/[\\/]$/.test(msg.path)) {
+      abs = path.join(abs, typeof msg.name === 'string' && msg.name ? path.basename(msg.name) : 'bib-shot.png');
+    }
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, buf);
+    reply({ result: { path: abs, bytes: buf.length } });
+  } catch (e) {
+    reply({ error: { code: 'SAVE_FAILED', message: String((e && e.message) || e) } });
   }
 }

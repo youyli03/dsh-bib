@@ -26,7 +26,7 @@
 | `browser_click` | 点击：**优先 `ref`**（树节点 ref，自动滚动到元素点中心）；无 ref 按坐标 |
 | `browser_type` | 输入文本（绕过 IME，中文可用；末尾换行触发回车） |
 | `browser_scroll` | 滚轮 |
-| `browser_screenshot` | 返回当前帧 dataURL + 尺寸 |
+| `browser_screenshot` | 返回当前帧 dataURL + 尺寸；`saveTo=<绝对路径>` 落盘并返回文件路径（供 `read_image`/`modlens` 看图，base64 不进上下文），`fullPage=true` 整页 PNG |
 | `browser_eval` | 执行 JS 并返回值 |
 | `browser_tabs` | 列出全部标签 |
 | `browser_switch` | 切换激活标签 |
