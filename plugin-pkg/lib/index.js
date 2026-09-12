@@ -184,6 +184,27 @@ export default {
       emitStatus();
     }
 
+    // 会话级停止：只 detach 本会话的标签（保留标签页）；若已无任何会话在用 bib，
+    // 就顺手全局停止（"最后一个走的人关灯"，把桥和资源一起释放）。
+    // 返回是否还有其他会话在占用浏览器。
+    async function stopForSession(sessionId) {
+      const st = sessionId ? sessions.get(sessionId) : null;
+      const tabId = st ? st.activeTabId : null;
+      if (tabId != null) {
+        try { await sendCommand('detach', { tabId }, 5000); } catch { /* 扩展不在也无所谓 */ }
+      }
+      if (st) resetSessionTab(st, '');
+      let others = false;
+      for (const [sid, s] of sessions) {
+        if (sid !== sessionId && s.activeTabId != null) { others = true; break; }
+      }
+      if (!others) {
+        try { await sendCommand('stop', {}); } catch { /* ignore */ }
+        stopBridge();
+      }
+      return others;
+    }
+
     function rejectAll(code, message) {
       for (const [, p] of pending) {
         try { p.disposer(); } catch { /* ignore */ }
@@ -449,6 +470,55 @@ export default {
 
     const sleep = (ms) => new Promise((resolve) => { timer.timeout(resolve, ms); });
 
+    // base64 → 字节（宿主无 Buffer 时退回 atob；两者都无则报错让调用方回退到 saveTo）
+    function base64Bytes(b64) {
+      try { if (typeof Buffer !== 'undefined') return Buffer.from(b64, 'base64'); } catch { /* fall through */ }
+      if (typeof atob === 'function') {
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+      }
+      throw new Error('当前宿主没有 base64 解码能力');
+    }
+
+    // 把截图像素挂成 DSH 附件，返回 ImageBlock 需要的引用（与 read_image 同一条路径）。
+    // 只在"当前模型确实声明了图片输入"时可用；否则给出可读原因，让调用方回退到 saveTo。
+    async function attachScreenshot(exec, base64, format) {
+      const attachments = ctx.get('attachments');
+      if (!attachments || typeof attachments.saveImage !== 'function') {
+        throw new Error('当前部署未挂载 attachments 服务');
+      }
+      const llm = ctx.get('llm');
+      let cfg;
+      try {
+        const session = exec && exec.agent && exec.agent.session;
+        cfg = session && typeof session.requestHeader === 'function' ? session.requestHeader().config : undefined;
+      } catch { cfg = undefined; }
+      const agentOptions = (exec && exec.agent && exec.agent.options) || {};
+      const provider = (cfg && cfg.provider) || agentOptions.provider;
+      const model = (cfg && cfg.model) || agentOptions.model;
+      if (!llm || !provider || !model) throw new Error('无法解析当前模型路由，不能确认它支持图片输入');
+      const info = await llm.resolveModelInfo(provider, model, exec && exec.signal);
+      const modes = info && info.inputModalities;
+      if (!Array.isArray(modes) || !modes.includes('image')) {
+        throw new Error('当前模型 ' + model + ' 未声明图片输入，请切换到支持视觉的模型');
+      }
+      const ref = await attachments.saveImage({
+        data: base64Bytes(base64),
+        mediaType: 'image/' + format,
+        name: 'bib-' + Date.now() + '.' + (format === 'png' ? 'png' : 'jpg'),
+      });
+      return {
+        attachmentId: ref.attachmentId,
+        mediaType: ref.mediaType,
+        bytes: ref.bytes,
+        width: ref.width,
+        height: ref.height,
+        ...(ref.name === undefined ? {} : { name: ref.name }),
+      };
+    }
+
     // 操作后主动截帧更新该会话的帧缓存（后台标签 screencast 节流，靠按需截帧保证画面）
     async function applyShotFor(sessionId) {
       try {
@@ -568,7 +638,10 @@ export default {
               text = errText(value);
             } else if (render) {
               try {
-                text = render(args, value);
+                const out = render(args, value);
+                // 工具可自行返回内容块数组（例如内联图片）——数组即最终 content
+                if (Array.isArray(out)) return out;
+                text = out;
               } catch (e) {
                 text = '渲染摘要失败: ' + ((e && e.message) || e);
               }
@@ -706,8 +779,9 @@ export default {
     }, (args, exec) => runAction(exec, 'scroll', { x: args.x, y: args.y, dx: args.dx, dy: args.dy }),
       (args, value) => '✓ 已滚动 dx=' + (args.dx || 0) + ' dy=' + (args.dy || 0) + treeSection(value));
 
-    registerTool('browser_screenshot', '截取当前会话激活标签的画面。默认只返回尺寸（像素不会进模型上下文）；saveTo=<绝对路径> 落盘并返回文件路径（配合 read_image 真正看图）；fullPage=true 整页 PNG。', {
+    registerTool('browser_screenshot', '截取当前会话激活标签的画面。默认只返回尺寸；inline=true 直接把图片给模型看（需当前模型声明图片输入）；saveTo=<绝对路径> 落盘并返回文件路径（配合 read_image）；fullPage=true 整页 PNG。', {
       saveTo: { type: 'string', description: '可选：截图保存到该绝对路径（以分隔符结尾视为目录，自动命名）；此时返回路径' },
+      inline: { type: 'boolean', description: '可选：把截图作为图片直接返回给模型（需要当前模型支持图片输入；可同时配合 saveTo）' },
       fullPage: { type: 'boolean', description: '可选：整页截图（PNG）；默认只截视口（JPEG）' },
     }, async (args, exec) => {
       const sessionId = sessionIdOf(exec);
@@ -734,51 +808,65 @@ export default {
       }
       if (!shot) return errResult('NO_FRAME', '扩展亦无帧');
       const format = shot.format === 'png' ? 'png' : 'jpeg';
+      const base = { width: shot.width || 0, height: shot.height || 0, fullPage: shot.fullPage === true, format };
+      // ① saveTo：落盘（桥的本地命令；ctx.fs 只有文本原语，二进制图写不了）
+      let saved = null;
       if (args.saveTo) {
-        // 落盘由桥的本地命令 saveFile 完成：ctx.fs 只能写文本，二进制图写不了
         const name = 'bib-' + new Date().toISOString().replace(/[:.]/g, '-') + '.' + (format === 'png' ? 'png' : 'jpg');
-        let saved;
         try {
           saved = await sendCommand('saveFile', { path: args.saveTo, name, data: shot.data }, 30000);
         } catch (e) {
           return errResult((e && e.code) || 'SAVE_FAILED', '保存失败：' + String((e && e.message) || e));
         }
+      }
+      // ② inline：把像素作为 image 内容块直接给模型（与 read_image 同一条附件路径）
+      let image = null;
+      let inlineError = '';
+      if (args.inline) {
+        try { image = await attachScreenshot(exec, shot.data, format); }
+        catch (e) { inlineError = String((e && e.message) || e); }
+      }
+      if (!args.saveTo && !args.inline) {
+        // 默认只回尺寸：DSH 只把 output.render 的返回值给模型看，原始 value 既不进
+        // 上下文也不落盘 —— 回传 base64 只会白占内存。要看图走 saveTo 或 inline。
         return {
           ok: true,
           result: {
-            path: (saved && saved.path) || args.saveTo,
-            bytes: (saved && saved.bytes) || 0,
-            width: shot.width || 0,
-            height: shot.height || 0,
-            // 报告**实际**结果：整页失败时扩展会回退视口帧，别把请求参数当结果回传
-            fullPage: shot.fullPage === true,
-            format,
+            ...base,
+            dataLength: (shot.data || '').length,
+            seq: shot.seq || 0,
+            hint: '如需查看画面：browser_screenshot({ inline: true }) 直接看图，或 { saveTo: "绝对路径" } 落盘后 read_image',
           },
         };
       }
-      // 默认不回 dataURL：DSH 只把 output.render 的返回值（content）给模型看，
-      // 原始 value 既不进上下文也不落盘 —— 回传 base64 只会白占内存，还让渲染文案说谎。
-      // 要"看图"请走 saveTo：落盘 → read_image。
       return {
         ok: true,
         result: {
-          dataLength: (shot.data || '').length,
-          width: shot.width || 0,
-          height: shot.height || 0,
-          seq: shot.seq || 0,
-          format,
-          hint: '如需查看画面：再调用 browser_screenshot({ saveTo: "绝对路径" })，然后用 read_image 读该文件',
+          ...base,
+          ...(saved ? { path: (saved && saved.path) || args.saveTo, bytes: (saved && saved.bytes) || 0 } : {}),
+          ...(image ? { image } : {}),
+          ...(inlineError ? { inlineError } : {}),
         },
       };
     }, (args, value) => {
       const r = value.result || {};
       const size = (r.width || 0) + '×' + (r.height || 0);
-      const fellBack = args.fullPage && !r.fullPage ? '；整页截图未生效，已回退视口' : '';
-      if (r.path) {
-        return '📷 已保存 ' + r.path + '（' + (r.bytes || 0) + ' 字节，' + size + (r.fullPage ? '，整页' : '') + '）' + fellBack + ' → 用 read_image 查看';
+      const tail = (r.fullPage ? '，整页' : '') + (args.fullPage && !r.fullPage ? '；整页未生效已回退视口' : '');
+      // inline 成功：文本块 + 图片块（模型当场看见，无需落盘再读）
+      if (r.image) {
+        return [
+          { type: 'text', text: '📷 截图 ' + size + tail + (r.path ? '（另已保存 ' + r.path + '）' : '') + '：' },
+          { type: 'image', attachment: r.image },
+        ];
       }
-      return '📷 当前帧 ' + size + (r.seq ? ' (seq ' + r.seq + ')' : '') + '（模型看不到像素）' + fellBack +
-        '。要看画面：browser_screenshot({ saveTo: "F:\\\\shots\\\\a.png" }) 再用 read_image';
+      if (r.path) {
+        return '📷 已保存 ' + r.path + '（' + (r.bytes || 0) + ' 字节，' + size + tail + '）→ 用 read_image 查看';
+      }
+      if (r.inlineError) {
+        return '📷 截图 ' + size + tail + '：inline 不可用（' + r.inlineError + '）→ 改用 saveTo + read_image';
+      }
+      return '📷 当前帧 ' + size + (r.seq ? ' (seq ' + r.seq + ')' : '') + '（模型看不到像素）' + tail +
+        '。要看画面：browser_screenshot({ inline: true })，或 { saveTo: "F:\\\\shots\\\\a.png" } 再用 read_image';
     });
 
     registerTool('browser_eval', '在激活标签页执行 JS 表达式并返回值（JSON 序列化）。', {
@@ -848,13 +936,14 @@ export default {
       return runAction(exec, 'activate', {}, { timeout: 10000 });
     }, () => '✓ 已把 Edge 窗口带到前台（人可直接操作）');
 
-    registerTool('browser_stop', '停止浏览器（停 screencast 并 detach 全部标签，保留标签页；清空全部会话状态）。', {}, async () => {
-      try {
-        await sendCommand('stop', {});
-      } catch { /* ignore */ }
-      stopBridge();
-      return { ok: true, result: {} };
-    }, () => '✓ 浏览器已停止（标签页保留）');
+    registerTool('browser_stop', '停止本会话的浏览器控制（只 detach 本会话标签，保留标签页；其他会话不受影响）。若已无任何会话在使用 bib，则顺手全局停止（拆桥并清空全部会话状态）。', {}, async (args, exec) => {
+      const sessionId = sessionIdOf(exec);
+      const others = await stopForSession(sessionId);
+      return { ok: true, result: { global: !others } };
+    }, (args, value) => {
+      const global = !!(value && value.result && value.result.global);
+      return global ? '✓ 浏览器已停止（全局：已无其他会话在使用）' : '✓ 已停止本会话的浏览器控制（其他会话不受影响）';
+    });
 
     // 同步某会话的标签列表与激活标签
     async function syncTabs(sessionId) {
@@ -943,9 +1032,14 @@ export default {
               break;
             case 'stop':
               out = await bibSafe(async () => {
-                try { await sendCommand('stop', {}); } catch { /* ignore */ }
-                stopBridge();
-                return { ok: true };
+                if (!sessionId) {
+                  // 无会话上下文（旧客户端/脚本）：等价于全局停止
+                  try { await sendCommand('stop', {}); } catch { /* ignore */ }
+                  stopBridge();
+                  return { ok: true, global: true };
+                }
+                const others = await stopForSession(sessionId);
+                return { ok: true, global: !others };
               });
               break;
             case 'poll':

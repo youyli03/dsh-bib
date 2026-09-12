@@ -730,6 +730,36 @@ async function doStop() {
   return { ok: true, result: {} };
 }
 
+// 会话级停止：只 detach 指定标签（保留标签页本身），让出全局激活位给其它会话。
+// 与 doStop（全局）和 doClose（连标签一起关）区分开。
+async function doDetachTab(tabId) {
+  if (tabId == null) return { ok: false, error: { code: 'NO_TAB', message: 'detach 需要 tabId' } };
+  if (state.attached.has(tabId)) {
+    try { await stopScreencast(tabId); } catch { /* ignore */ }
+    try { await new Promise((res) => chrome.debugger.detach({ tabId }, res)); } catch { /* ignore */ }
+    state.attached.delete(tabId);
+  }
+  state.tabs.delete(tabId);
+  if (state.tabId === tabId) {
+    state.tabId = null;
+    state.lastFrame = null;
+    const next = state.tabs.keys().next().value;
+    if (next != null) {
+      state.tabId = next;
+      try { await startScreencast(next); } catch { /* ignore */ }
+    }
+  }
+  // 持久化的 attach 目标若正是这个标签：还有别的标签就改记它，一个都不剩才清空
+  try {
+    const cur = await chrome.storage.local.get('bibTab');
+    if (cur && cur.bibTab === tabId) {
+      const next = state.attached.values().next().value;
+      if (next != null) await rememberTab(next); else await forgetTab();
+    }
+  } catch { /* ignore */ }
+  return { ok: true, result: { tabId, remaining: state.attached.size } };
+}
+
 // ---------------- 命令分发 ----------------
 async function dispatch(cmd, tabId) {
   switch (cmd.cmd) {
@@ -767,6 +797,8 @@ async function dispatch(cmd, tabId) {
       return await doNewTab(cmd.url);
     case 'switch':
       return await doSwitch(cmd.tabId);
+    case 'detach':
+      return await doDetachTab(cmd.tabId);
     case 'close':
       return await doClose(cmd.tabId);
     case 'tabs':
