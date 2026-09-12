@@ -32,6 +32,8 @@ export default {
           frame: null,            // {seq, data, width, height}
           lastSeq: -1,
           lastFrameAt: 0,
+          lastPollAt: 0,          // 客户端 dock 最近一次 poll：没人看就不必再截帧
+          lastActivityAt: 0,      // 最近一次命令/轮询：用于回收长期空闲会话
           rev: 0,
           lastTreeHash: null,
           lastClick: null,        // {x, y}
@@ -42,6 +44,18 @@ export default {
         sessions.set(sessionId, s);
       }
       return s;
+    }
+
+    // 清掉一个会话的标签绑定与派生状态（标签被关 / 扩展 detach / 切换失败时用），
+    // 否则后续命令会全部打在已经不存在的 tabId 上，报错信息还指不到根因。
+    function resetSessionTab(st, why) {
+      st.activeTabId = null;
+      st.tabs = [];
+      st.frame = null;
+      st.lastSeq = -1;
+      st.lastFrameAt = 0;
+      st.lastTreeHash = null;
+      st.lastError = why || '';
     }
 
     function sessionIdOf(exec) {
@@ -191,7 +205,10 @@ export default {
           // Host 侧由下次命令/轮询按各会话 activeTabId 主动截帧校正。
           break;
         case 'state':
-          // 全局 url/title 事件不再直接写入；各会话状态由命令返回同步。
+          // 全局 url/title 事件不再直接写入（各会话状态由命令返回同步），但它是
+          // 「扩展仍 attach 且存活」的证据：据此从 degraded 自愈。否则 degraded 是
+          // 单向死状态 —— 除桥重启外没有任何路径把它变回 running。
+          if (bridgeStatus === 'degraded') { bridgeStatus = 'running'; emitStatus(); }
           break;
         case 'ok': {
           const p = pending.get(msg.id);
@@ -200,6 +217,8 @@ export default {
             p.disposer();
             p.resolve(msg.result || {});
           }
+          // 命令被扩展成功执行 = 扩展在线：同样视为 degraded 自愈证据
+          if (bridgeStatus === 'degraded') { bridgeStatus = 'running'; emitStatus(); }
           break;
         }
         case 'err': {
@@ -223,10 +242,11 @@ export default {
     }
 
     // ---------------- 命令通道 ----------------
-    // cmdTabId：命令目标标签（会话 activeTabId）；省略时走扩展全局激活标签。
+    // cmd.tabId：命令目标标签（会话 activeTabId）。degraded 也放行 —— ensureRunning
+    // 要靠一条 ping 探活把这个状态救回来，否则只能空等超时。
     function sendCommand(cmd, params, timeoutMs) {
       return new Promise((resolve, reject) => {
-        if (bridgeStatus !== 'running' || !bridge) {
+        if ((bridgeStatus !== 'running' && bridgeStatus !== 'degraded') || !bridge) {
           reject(Object.assign(new Error('浏览器未运行'), { code: 'NOT_RUNNING' }));
           return;
         }
@@ -246,13 +266,19 @@ export default {
       });
     }
 
+    // 作用于「本会话激活标签」的命令：未绑定标签时必须显式拒绝，绝不能退化成
+    // 「浏览器全局活动标签」—— 否则 A 会话会静默操作 B 会话（或用户自己）的标签页。
+    const TAB_COMMANDS = new Set(['navigate', 'go', 'reload', 'click', 'scroll', 'type', 'eval', 'tree', 'screenshot', 'activate']);
+
     // 按会话执行命令：自动带上该会话的 activeTabId（会话专属标签路由）
     async function sessionCommand(sessionId, cmd, params, timeoutMs) {
       const s = sessionState(sessionId);
       const p = params || {};
-      // navigate/go/reload/click/scroll/type/eval/tree/screenshot 都作用于激活标签；
-      // switch/newTab 由扩展端管理，这里显式路由。
-      if (s.activeTabId != null && ['navigate','go','reload','click','scroll','type','eval','tree','screenshot','activate'].includes(cmd)) {
+      s.lastActivityAt = Date.now();
+      if (TAB_COMMANDS.has(cmd)) {
+        if (s.activeTabId == null) {
+          throw Object.assign(new Error('本会话尚未绑定标签页：先 browser_open <url> 打开专属标签，或用 browser_tabs + browser_switch 接管现有标签'), { code: 'NO_TAB' });
+        }
         p.tabId = s.activeTabId;
       }
       return sendCommand(cmd, p, timeoutMs);
@@ -386,13 +412,25 @@ export default {
     // ---------------- 工具执行骨架 ----------------
     async function ensureRunning() {
       if (bridgeStatus === 'running') return;
-      if (bridgeStatus === 'starting' || bridgeStatus === 'degraded') {
+      // degraded = 扩展 detach：桥还活着，主动 ping 探活一次即可判定真伪。
+      // 旧实现只是空等 5s 然后失败（而除桥重启外没有任何路径把 degraded 变回
+      // running），等于把浏览器永久锁死。
+      if (bridgeStatus === 'degraded') {
+        try {
+          await sendCommand('ping', {}, 3000);
+          if (bridgeStatus !== 'running') { bridgeStatus = 'running'; emitStatus(); }
+          return;
+        } catch (e) {
+          throw Object.assign(new Error('扩展已离线：请在 Edge 打开 dsh-bib 扩展 popup 点一次「连接」，或让模型 browser_open 重新绑定'), { code: 'EXTENSION_OFFLINE' });
+        }
+      }
+      if (bridgeStatus === 'starting') {
         const ok = await waitForStatus('running', 5000);
         if (ok) return;
         // 'starting' without a live bridge handle is a wedge (a synchronous
         // spawn throw leaves both behind): demote it so the start path below
         // retries instead of failing every tool call until DSH restarts.
-        if (bridgeStatus === 'starting' && !bridge) {
+        if (!bridge) {
           bridgeStatus = 'error';
           if (!bridgeLastError) bridgeLastError = '桥启动超时（未收到 ready）';
           emitStatus();
@@ -425,15 +463,22 @@ export default {
       } catch { /* 截帧失败不阻塞操作 */ }
     }
 
-    // 周期主动截帧：仅为有激活标签的会话截帧（无会话上下文时跳过 —— 帧由
-    // 各会话自己的命令/轮询驱动，避免多会话互相覆盖帧缓存）。
+    // 周期主动截帧：只服务"正在被人看"的会话 —— 客户端 dock 每 500ms poll 一次，
+    // 没人 poll（窗口收起/切到别的会话）就不再产生 screencast 流量；顺带回收长期
+    // 空闲且未绑定标签的会话状态（sessions Map 否则只增不减）。
     let refreshing = false;
     const refreshTick = timer.interval(async () => {
       if (bridgeStatus !== 'running' || refreshing) return;
       refreshing = true;
+      const now = Date.now();
       try {
         for (const [sid, st] of sessions) {
-          if (st.activeTabId != null && Date.now() - st.lastFrameAt > 1500) {
+          if (st.activeTabId == null) {
+            if (now - (st.lastActivityAt || 0) > 30 * 60 * 1000) sessions.delete(sid);
+            continue;
+          }
+          if (now - (st.lastPollAt || 0) > 5000) continue;
+          if (now - st.lastFrameAt > 1500) {
             try { await applyShotFor(sid); } catch { /* ignore */ }
           }
         }
@@ -457,6 +502,8 @@ export default {
       try {
         res = await sessionCommand(sessionId, cmdName, cmdArgs, opts.timeout || 10000);
       } catch (e) {
+        // 标签被关掉 / 扩展 detach：先清陈旧绑定，让下一次调用重新绑定而不是继续失败
+        if (e && e.code === 'NOT_ATTACHED') resetSessionTab(st, '标签已关闭或扩展已 detach');
         return errResult(e.code || 'BRIDGE_ERROR', (e && e.message) || String(e));
       }
       // newTab：结果带 tabId，绑定为会话专属标签后再建树（否则 tree 无 tabId 会串到别的会话）
@@ -543,9 +590,7 @@ export default {
       ctx.effect(() => disposer, 'dsh-bib: ' + name);
     }
 
-    registerTool('browser_status', '查询 dsh-bib 浏览器运行状态与当前激活标签的 url/title（按当前会话）。', {
-      status: { type: 'string', description: 'stopped|starting|running|degraded|error' },
-    }, async (args, exec) => {
+    registerTool('browser_status', '查询 dsh-bib 浏览器运行状态与当前会话激活标签的 url/title。', {}, async (args, exec) => {
       const sessionId = sessionIdOf(exec);
       const st = sessionId ? sessionState(sessionId) : null;
       return {
@@ -661,8 +706,8 @@ export default {
     }, (args, exec) => runAction(exec, 'scroll', { x: args.x, y: args.y, dx: args.dx, dy: args.dy }),
       (args, value) => '✓ 已滚动 dx=' + (args.dx || 0) + ' dy=' + (args.dy || 0) + treeSection(value));
 
-    registerTool('browser_screenshot', '返回激活标签页当前帧 dataURL（base64 JPEG）与内在尺寸（按当前会话）。传 saveTo 则落盘并返回文件路径（供 read_image 使用），传 fullPage 则整页 PNG。', {
-      saveTo: { type: 'string', description: '可选：截图保存到该绝对路径（以分隔符结尾视为目录，自动命名）；此时返回路径而非 base64' },
+    registerTool('browser_screenshot', '截取当前会话激活标签的画面。默认只返回尺寸（像素不会进模型上下文）；saveTo=<绝对路径> 落盘并返回文件路径（配合 read_image 真正看图）；fullPage=true 整页 PNG。', {
+      saveTo: { type: 'string', description: '可选：截图保存到该绝对路径（以分隔符结尾视为目录，自动命名）；此时返回路径' },
       fullPage: { type: 'boolean', description: '可选：整页截图（PNG）；默认只截视口（JPEG）' },
     }, async (args, exec) => {
       const sessionId = sessionIdOf(exec);
@@ -670,7 +715,7 @@ export default {
       try {
         await ensureRunning();
       } catch (e) {
-        return errResult('NOT_RUNNING', '浏览器未启动');
+        return errResult((e && e.code) || 'NOT_RUNNING', (e && e.message) || '浏览器未启动');
       }
       const st = sessionState(sessionId);
       const fullPage = !!args.fullPage;
@@ -705,26 +750,35 @@ export default {
             bytes: (saved && saved.bytes) || 0,
             width: shot.width || 0,
             height: shot.height || 0,
-            fullPage,
+            // 报告**实际**结果：整页失败时扩展会回退视口帧，别把请求参数当结果回传
+            fullPage: shot.fullPage === true,
             format,
           },
         };
       }
+      // 默认不回 dataURL：DSH 只把 output.render 的返回值（content）给模型看，
+      // 原始 value 既不进上下文也不落盘 —— 回传 base64 只会白占内存，还让渲染文案说谎。
+      // 要"看图"请走 saveTo：落盘 → read_image。
       return {
         ok: true,
         result: {
-          data: 'data:image/' + format + ';base64,' + shot.data,
+          dataLength: (shot.data || '').length,
           width: shot.width || 0,
           height: shot.height || 0,
           seq: shot.seq || 0,
+          format,
+          hint: '如需查看画面：再调用 browser_screenshot({ saveTo: "绝对路径" })，然后用 read_image 读该文件',
         },
       };
     }, (args, value) => {
       const r = value.result || {};
+      const size = (r.width || 0) + '×' + (r.height || 0);
+      const fellBack = args.fullPage && !r.fullPage ? '；整页截图未生效，已回退视口' : '';
       if (r.path) {
-        return '📷 已保存 ' + r.path + '（' + (r.bytes || 0) + ' 字节，' + (r.width || 0) + '×' + (r.height || 0) + (r.fullPage ? '，整页' : '') + '）';
+        return '📷 已保存 ' + r.path + '（' + (r.bytes || 0) + ' 字节，' + size + (r.fullPage ? '，整页' : '') + '）' + fellBack + ' → 用 read_image 查看';
       }
-      return '📷 截图 ' + (r.width || 0) + '×' + (r.height || 0) + (r.seq ? ' (seq ' + r.seq + ')' : '') + '（画面数据已返回给模型）';
+      return '📷 当前帧 ' + size + (r.seq ? ' (seq ' + r.seq + ')' : '') + '（模型看不到像素）' + fellBack +
+        '。要看画面：browser_screenshot({ saveTo: "F:\\\\shots\\\\a.png" }) 再用 read_image';
     });
 
     registerTool('browser_eval', '在激活标签页执行 JS 表达式并返回值（JSON 序列化）。', {
@@ -736,32 +790,56 @@ export default {
         return '✓ ' + shortText(typeof v === 'string' ? v : JSON.stringify(v), 2000);
       });
 
-    registerTool('browser_tabs', '列出当前会话的标签页（tabId、url、title、是否激活）。', {}, async (args, exec) => {
+    registerTool('browser_tabs', '列出浏览器全部标签（tabId、url、title；★=本会话绑定，▶=浏览器当前标签），可用 browser_switch 接管其中任意一个。', {}, async (args, exec) => {
       const sessionId = sessionIdOf(exec);
       if (!sessionId) return errResult('NO_SESSION', '无法确定当前会话');
       try {
         await ensureRunning();
       } catch (e) {
-        return errResult('NOT_RUNNING', '浏览器未启动');
+        return errResult((e && e.code) || 'NOT_RUNNING', (e && e.message) || '浏览器未启动');
       }
       await syncTabs(sessionId);
       const st = sessionState(sessionId);
-      return { ok: true, result: { tabs: st.tabs }, tree: (await buildTreeFor(exec, sessionId)).tree };
+      let all = [];
+      try {
+        const r = await sendCommand('tabs', {}, 5000);
+        // 列出全部标签：会话要能"接管"用户正在看的标签（只看自己那个就没法接管）
+        all = ((r && r.tabs) || []).map((t) => ({
+          tabId: t.tabId,
+          url: t.url || '',
+          title: t.title || '',
+          active: !!t.active,
+          mine: t.tabId === st.activeTabId,
+        }));
+      } catch (e) {
+        return errResult((e && e.code) || 'BRIDGE_ERROR', (e && e.message) || String(e));
+      }
+      return { ok: true, result: { tabs: all, activeTab: st.activeTabId }, tree: (await buildTreeFor(exec, sessionId)).tree };
     }, (args, value) => {
       const r = value.result || {};
-      const tabs = (r.tabs || []).map((t) => (t.active ? '▶' : '') + 'tabId=' + t.tabId + ' ' + (t.title || t.url || '(无标题)'));
-      return '标签 ' + (r.tabs || []).length + ' 个:\n' + tabs.join('\n') + treeSection(value);
+      const tabs = (r.tabs || []).map((t) => (t.mine ? '★' : (t.active ? '▶' : ' ')) + ' tabId=' + t.tabId + ' ' + (t.title || t.url || '(无标题)'));
+      return '标签 ' + (r.tabs || []).length + ' 个（★=本会话绑定，▶=浏览器当前）:\n' + tabs.join('\n') + treeSection(value);
     });
 
-    registerTool('browser_switch', '切换当前会话的激活标签页（单激活模型：帧流/树/操作只针对该标签）。', {
+    registerTool('browser_switch', '切换当前会话的激活标签页（单激活模型：帧流/树/操作只针对该标签）；可接管 browser_tabs 列出的任意标签。', {
       tabId: { type: 'number', description: '目标标签 tabId（来自 browser_tabs）' },
     }, async (args, exec) => {
       const sessionId = sessionIdOf(exec);
       if (!sessionId) return errResult('NO_SESSION', '无法确定当前会话');
       const st = sessionState(sessionId);
+      const prev = st.activeTabId;
       st.activeTabId = args.tabId;
       const res = await runAction(exec, 'switch', { tabId: args.tabId });
+      if (!res || res.ok === false) {
+        st.activeTabId = prev;   // 切换失败不要把会话锁在坏 tabId 上
+        return res;
+      }
       await syncTabs(sessionId);
+      if (st.tabs.length === 0) {
+        st.activeTabId = prev;
+        await syncTabs(sessionId);
+        return errResult('NO_TAB', 'tabId ' + args.tabId + ' 不存在或未 attach：先用 browser_tabs 查看');
+      }
       return res;
     }, (args, value) => '✓ 已切换到 tab ' + args.tabId + treeSection(value));
 
@@ -834,6 +912,9 @@ export default {
           // 会话路由：RPC 必须带 sessionId（Client 从 dock standardProps 注入）
           const sessionId = str('sessionId', '');
           const st = sessionId ? sessionState(sessionId) : null;
+          // dock 的每次 RPC（尤其 500ms 的 poll）都是"有人在看"的信号：
+          // refreshTick 据此决定要不要为这个会话持续截帧。
+          if (st) { st.lastPollAt = Date.now(); st.lastActivityAt = Date.now(); }
           // 会话视角状态：仅当本会话绑定过专属标签（activeTabId != null）才算 running；
           // 否则即使全局 bridge 在跑（其他会话在用），本会话窗口也应显示 stopped，
           // 避免「没打开浏览器却弹出内嵌浏览器窗口」。

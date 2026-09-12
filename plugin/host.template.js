@@ -175,6 +175,9 @@ return {
         case 'state':
           state.url = msg.url || '';
           state.title = msg.title || '';
+          // 扩展仍 attach 且在发状态 = 存活证据：从 degraded 自愈（否则 degraded
+          // 是单向死状态，除桥重启外没有路径能变回 running）
+          if (state.status === 'degraded') { state.status = 'running'; emitStatus(); }
           break;
         case 'ok': {
           const p = pending.get(msg.id);
@@ -183,6 +186,7 @@ return {
             p.disposer();
             p.resolve(msg.result || {});
           }
+          if (state.status === 'degraded') { state.status = 'running'; emitStatus(); }
           break;
         }
         case 'err': {
@@ -206,9 +210,10 @@ return {
     }
 
     // ---------------- 命令通道 ----------------
+    // degraded 也放行：ensureRunning 要靠一条 ping 探活把这个状态救回来
     function sendCommand(cmd, params, timeoutMs) {
       return new Promise((resolve, reject) => {
-        if (state.status !== 'running' || !bridge) {
+        if ((state.status !== 'running' && state.status !== 'degraded') || !bridge) {
           reject(Object.assign(new Error('浏览器未运行'), { code: 'NOT_RUNNING' }));
           return;
         }
@@ -352,13 +357,23 @@ return {
     // ---------------- 工具执行骨架 ----------------
     async function ensureRunning() {
       if (state.status === 'running') return;
-      if (state.status === 'starting' || state.status === 'degraded') {
+      // degraded = 扩展 detach：桥还活着，ping 探活一次即可判定真伪（旧实现只是空等 5s）
+      if (state.status === 'degraded') {
+        try {
+          await sendCommand('ping', {}, 3000);
+          if (state.status !== 'running') { state.status = 'running'; emitStatus(); }
+          return;
+        } catch (e) {
+          throw Object.assign(new Error('扩展已离线：请在 Edge 打开 dsh-bib 扩展 popup 点一次「连接」，或让模型 browser_open 重新绑定'), { code: 'EXTENSION_OFFLINE' });
+        }
+      }
+      if (state.status === 'starting') {
         const ok = await waitForStatus('running', 5000);
         if (ok) return;
         // 'starting' without a live bridge handle is a wedge (a synchronous
         // spawn throw leaves both behind): demote it so the start path below
         // retries instead of failing every tool call until DSH restarts.
-        if (state.status === 'starting' && !bridge) {
+        if (!bridge) {
           state.status = 'error';
           if (!state.lastError) state.lastError = '桥启动超时（未收到 ready）';
           emitStatus();
@@ -450,9 +465,7 @@ return {
       ctx.effect(() => disposer);
     }
 
-    registerTool('browser_status', '查询 dsh-bib 浏览器运行状态与当前激活标签的 url/title。', {
-      status: { type: 'string', description: 'stopped|starting|running|degraded|error' },
-    }, async () => ({
+    registerTool('browser_status', '查询 dsh-bib 浏览器运行状态与当前激活标签的 url/title。', {}, async () => ({
       ok: true,
       result: {
         state: state.status,
@@ -520,7 +533,7 @@ return {
       dx: { type: 'number', description: '水平滚动量' }, dy: { type: 'number', description: '垂直滚动量' },
     }, (args, exec) => runAction(exec, 'scroll', { x: args.x, y: args.y, dx: args.dx, dy: args.dy }));
 
-    registerTool('browser_screenshot', '返回激活标签页当前帧 dataURL（base64 JPEG）与内在尺寸。传 saveTo 落盘并返回路径，传 fullPage 整页 PNG。', {
+    registerTool('browser_screenshot', '截取激活标签页画面。默认只返回尺寸（像素不会进模型上下文）；saveTo=<绝对路径> 落盘并返回文件路径（配合 read_image 真正看图）；fullPage=true 整页 PNG。', {
       saveTo: { type: 'string', description: '可选：保存到该绝对路径（以分隔符结尾视为目录，自动命名）' },
       fullPage: { type: 'boolean', description: '可选：整页截图（PNG）；默认视口 JPEG' },
     }, async (args) => {
@@ -560,18 +573,23 @@ return {
             bytes: (saved && saved.bytes) || 0,
             width: shot.width || 0,
             height: shot.height || 0,
-            fullPage,
+            // 报告**实际**结果：整页失败时扩展会回退视口帧
+            fullPage: shot.fullPage === true,
             format,
           },
         };
       }
+      // 默认不回 dataURL：DSH 只把 output.render 的返回值给模型看，原始 value 既不进
+      // 上下文也不落盘 —— 回传 base64 只会白占内存。要看图请走 saveTo → read_image。
       return {
         ok: true,
         result: {
-          data: 'data:image/' + format + ';base64,' + shot.data,
+          dataLength: (shot.data || '').length,
           width: shot.width || 0,
           height: shot.height || 0,
           seq: shot.seq || 0,
+          format,
+          hint: '如需查看画面：再调用 browser_screenshot({ saveTo: "绝对路径" })，然后用 read_image 读该文件',
         },
       };
     });
@@ -580,11 +598,11 @@ return {
       expression: { type: 'string', description: 'JS 表达式' },
     }, (args, exec) => runAction(exec, 'eval', { expression: args.expression }, { timeout: 15000 }));
 
-    registerTool('browser_tabs', '列出全部标签（tabId、url、title、是否激活）。', {}, async (args, exec) => {
+    registerTool('browser_tabs', '列出全部标签（tabId、url、title、是否激活），可用 browser_switch 接管其中任意一个。', {}, async (args, exec) => {
       try {
         await ensureRunning();
       } catch (e) {
-        return errResult('NOT_RUNNING', '浏览器未启动');
+        return errResult((e && e.code) || 'NOT_RUNNING', (e && e.message) || '浏览器未启动');
       }
       const res = await sendCommand('tabs', {});
       await syncTabs();
