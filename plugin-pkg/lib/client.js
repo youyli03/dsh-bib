@@ -33,6 +33,8 @@ window.__ModuleLoader__.load({
 .dshbib-code { padding: 8px 10px; border-top: 1px solid var(--dsw-alias-separator-primary, #3f3f46); font-size: 11px; color: var(--dsw-alias-label-secondary, #a1a1aa); }
 .dshbib-code input { width: 100%; box-sizing: border-box; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--dsw-alias-border-l2, #3f3f46); background: transparent; color: var(--dsw-alias-label-primary, #e4e4e7); font-family: monospace; }
 .dshbib-error { color: var(--dsw-alias-state-error-primary, #f87171); }
+.dshbib-lost { margin: 8px; padding: 8px 12px; border: 1px solid var(--dsw-alias-state-warn-primary, #facc15); border-radius: 8px; background: var(--dsw-alias-bg-layer-2, #18181b); font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-primary, #e4e4e7); }
+.dshbib-lost-title { font-weight: 600; color: var(--dsw-alias-state-warn-primary, #facc15); margin-bottom: 2px; }
 `;
 
     /** Host RPC：同源 fetch 到 /dsh-bib/<name>?<query>，返回 JSON。自动携带当前会话 sessionId。 */
@@ -120,6 +122,8 @@ window.__ModuleLoader__.load({
         const [expanded, setExpanded] = React.useState(false);
         const [showCode, setShowCode] = React.useState(false);
         const [urlInput, setUrlInput] = React.useState('');
+        // 提问卡片丢失检测：模型在等 ask_user_question 回答，但普通输入框仍可见
+        const [lost, setLost] = React.useState(false);
         const lastSeq = React.useRef(-1);
         // 用户手动收起标记：手动收起后，帧更新不再自动展开（避免「缩回去又冒出来」）
         const userCollapsed = React.useRef(!!(stored && stored.userCollapsed));
@@ -166,6 +170,16 @@ window.__ModuleLoader__.load({
 
         React.useEffect(() => {
           const timer = window.setInterval(async () => {
+            // 提问卡片丢失检测（纯 DOM，不依赖 host）：模型在等 ask_user_question 回答
+            // （工具卡片 data-state=running），但普通输入框仍可见（data-slot 存在且未被
+            // 提问面板 display:none 隐藏）→ 提问面板因连接重连竞态丢失，提示用户中断恢复。
+            // 放最前：即使下方 rpc 挂起，本轮检测也已执行；setLost 同值会跳过重渲染。
+            try {
+              const waiting = !!document.querySelector('[data-tool="ask_user_question"][data-state="running"]');
+              const bar = document.querySelector('[data-slot="conversation.composer.bar"]');
+              const inputVisible = !!bar && (typeof bar.checkVisibility === 'function' ? bar.checkVisibility() : bar.getClientRects().length > 0);
+              setLost(waiting && inputVisible);
+            } catch { /* ignore */ }
             try {
               const r = await rpcRef.current('poll', {});
               setSt((prev) => {
@@ -301,7 +315,21 @@ window.__ModuleLoader__.load({
 
         let body;
         if (st.state === 'stopped') {
-          body = el('div', { className: 'dshbib-placeholder' }, '浏览器未启动：在对话中让模型调用 browser_open，或点「配对」连接扩展');
+          // 会话视角 stopped 有两种真实情况：桥未启动 / 桥在跑但本会话还没绑定专属标签
+          // （如其他会话正在用浏览器）。后者工具完全可用，原「浏览器未启动…点配对」文案会误导
+          // 用户以为浏览器没起来；按 st.bridge（全局桥真实状态）区分显示准确提示。
+          const bridge = st.bridge || '';
+          let msg;
+          if (bridge === 'running' || bridge === 'starting') {
+            msg = '浏览器运行中，本会话尚未打开页面：在对话中让模型调用 browser_open（将为本会话新建专属标签页）';
+          } else if (bridge === 'degraded') {
+            msg = '扩展离线：请在 Edge 打开 dsh-bib 扩展并 attach（本会话尚未打开页面，可让模型调用 browser_open）';
+          } else if (bridge === 'error') {
+            msg = '浏览器启动失败：' + (st.lastError || '请检查 Edge 中的 dsh-bib 扩展');
+          } else {
+            msg = '浏览器未启动：在对话中让模型调用 browser_open，或点「配对」连接扩展';
+          }
+          body = el('div', { className: 'dshbib-placeholder' }, msg);
         } else if (st.data) {
           body = el('img', {
             className: 'dshbib-img',
@@ -326,14 +354,26 @@ window.__ModuleLoader__.load({
           (st.state === 'degraded' ? '  ·  扩展离线：请在 Edge 打开扩展并 attach（专用窗口勿最小化）' : '') +
           (st.lastError ? '  ·  ' + st.lastError : '');
 
+        // 提问卡片丢失警示条：无操作按钮（中断即退避），模型回合结束后自动消失
+        const lostBanner = el('div', { className: 'dshbib-lost' },
+          el('div', { className: 'dshbib-lost-title' }, '提问卡片未显示'),
+          el('div', {}, '模型正在等你回答，但提问面板因连接重连未出现。点 ⏹（停止）中断当前回合，然后把答案直接发出来即可。'),
+        );
+
         // 轨迹视图隐藏：切到轨迹/瀑布视图时整个窗口不渲染（含已展开状态），回对话视图恢复
         if (trajectory) return null;
+
+        // 提问丢失且浏览器从未启动：单独显示一条警示卡（这是需要用户注意的真实问题）
+        if (lost && !shownRef.current) {
+          return el('div', { className: 'dshbib-card' }, lostBanner);
+        }
 
         // 初始（从未因活动出现）时完全隐藏；出现后收起为小横幅（仅头栏，可点击再展开）
         if (!expanded && !shownRef.current) return null;
 
         return el('div', { className: 'dshbib-card' },
           head,
+          lost ? lostBanner : null,
           expanded ? el('div', {},
             (st.tabs || []).length > 1 ? el('div', { className: 'dshbib-tabs' }, ...tabEls) : null,
             bar,

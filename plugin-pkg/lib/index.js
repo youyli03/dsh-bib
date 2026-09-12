@@ -791,6 +791,7 @@ export default {
             case 'status':
               out = await bibSafe(async () => ({
                 state: viewState,
+                bridge: bridgeStatus, // 全局桥真实状态（会话视角 stopped ≠ 桥未启动）
                 url: st ? st.url : '',
                 title: st ? st.title : '',
                 hasFrame: st ? !!st.frame : false,
@@ -817,6 +818,7 @@ export default {
             case 'poll':
               out = {
                 state: viewState,
+                bridge: bridgeStatus, // 全局桥真实状态（会话视角 stopped ≠ 桥未启动）
                 seq: st ? st.lastSeq : -1,
                 data: st && st.frame ? st.frame.data : '',
                 width: st && st.frame ? st.frame.width : 0,
