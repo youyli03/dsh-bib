@@ -211,6 +211,17 @@ return {
 
     // ---------------- 命令通道 ----------------
     // degraded 也放行：ensureRunning 要靠一条 ping 探活把这个状态救回来
+    const EXT_HINT = '请在 Edge 打开 dsh-bib 扩展 popup 点一次「连接」，或在 edge://extensions 重新加载扩展';
+
+    // 扩展没在超时内应答：标成 degraded 并留下可操作原因，避免每次调用都白等超时
+    function markExtensionUnresponsive(why) {
+      if (state.status === 'running') {
+        state.status = 'degraded';
+        state.lastError = '扩展无响应（' + why + '）：' + EXT_HINT;
+        emitStatus();
+      }
+    }
+
     function sendCommand(cmd, params, timeoutMs) {
       return new Promise((resolve, reject) => {
         if ((state.status !== 'running' && state.status !== 'degraded') || !bridge) {
@@ -218,10 +229,12 @@ return {
           return;
         }
         const id = cmdSeq++;
+        const ms = timeoutMs || 10000;
         const disposer = timer.timeout(() => {
           pending.delete(id);
-          reject(Object.assign(new Error('命令超时'), { code: 'TIMEOUT' }));
-        }, timeoutMs || 10000);
+          reject(Object.assign(new Error('命令超时（扩展未在 ' + Math.round(ms / 1000) + 's 内应答）：' + EXT_HINT), { code: 'TIMEOUT' }));
+          if (cmd !== 'saveFile') markExtensionUnresponsive('命令 ' + cmd + ' 超时');
+        }, ms);
         pending.set(id, { resolve, reject, disposer });
         try {
           bridge.stdin.write(JSON.stringify({ id, cmd, ...(params || {}) }) + '\n');

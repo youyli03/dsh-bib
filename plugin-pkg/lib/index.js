@@ -265,6 +265,18 @@ export default {
     // ---------------- 命令通道 ----------------
     // cmd.tabId：命令目标标签（会话 activeTabId）。degraded 也放行 —— ensureRunning
     // 要靠一条 ping 探活把这个状态救回来，否则只能空等超时。
+    const EXT_HINT = '请在 Edge 打开 dsh-bib 扩展 popup 点一次「连接」，或在 edge://extensions 重新加载扩展';
+
+    // 扩展没在超时内应答：标成 degraded 并留下可操作原因。否则每个 browser_* 调用
+    // 都要各自白等 5-30s 才失败，模型和人都会被拖住（这正是"打不开"的体感来源）。
+    function markExtensionUnresponsive(why) {
+      if (bridgeStatus === 'running') {
+        bridgeStatus = 'degraded';
+        bridgeLastError = '扩展无响应（' + why + '）：' + EXT_HINT;
+        emitStatus();
+      }
+    }
+
     function sendCommand(cmd, params, timeoutMs) {
       return new Promise((resolve, reject) => {
         if ((bridgeStatus !== 'running' && bridgeStatus !== 'degraded') || !bridge) {
@@ -272,10 +284,13 @@ export default {
           return;
         }
         const id = cmdSeq++;
+        const ms = timeoutMs || 10000;
         const disposer = timer.timeout(() => {
           pending.delete(id);
-          reject(Object.assign(new Error('命令超时'), { code: 'TIMEOUT' }));
-        }, timeoutMs || 10000);
+          reject(Object.assign(new Error('命令超时（扩展未在 ' + Math.round(ms / 1000) + 's 内应答）：' + EXT_HINT), { code: 'TIMEOUT' }));
+          // saveFile 由桥自己处理，超时说明桥卡住而非扩展；其余命令超时都归因扩展
+          if (cmd !== 'saveFile') markExtensionUnresponsive('命令 ' + cmd + ' 超时');
+        }, ms);
         pending.set(id, { resolve, reject, disposer });
         try {
           bridge.stdin.write(JSON.stringify({ id, cmd, ...(params || {}) }) + '\n');
