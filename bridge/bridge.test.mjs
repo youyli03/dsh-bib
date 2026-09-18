@@ -235,6 +235,12 @@ const tests = [
     rmSync(dirTmp, { recursive: true, force: true });
     return ok;
   }],
+  ['本地命令 bridgePing：不经扩展即时回环', async () => {
+    const p = waitMsg((x) => (x.type === 'ok' || x.type === 'err') && x.id === 94);
+    sendHostCmd({ id: 94, cmd: 'bridgePing' });
+    const m = await p;
+    return m.type === 'ok' && m.result && m.result.pong === true;
+  }],
   ['shutdown → exit 0', async () => {
     const p = waitMsg((x) => x.type === 'exit', 3000);
     sendHostCmd({ cmd: 'shutdown' });

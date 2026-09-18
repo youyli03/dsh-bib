@@ -222,6 +222,28 @@ return {
       }
     }
 
+    // 命令超时后判定故障层级并尽量自愈：桥本地回环（bridgePing，不经扩展）也不回
+    // → 宿主↔桥链路坏了 → 重启桥（扩展会自动发现新端口）；回环正常 → 怪扩展。
+    let diagnosing = false;
+    async function diagnoseAndRecover(why) {
+      if (diagnosing || !bridge) return;
+      diagnosing = true;
+      try {
+        try {
+          await sendCommand('bridgePing', {}, 2000);
+        } catch {
+          state.lastError = '桥链路无响应（命令结果回不来）：已自动重启桥，扩展会自动重新发现新端口';
+          stopBridge();
+          try { await startBridge(); } catch { /* 下次调用再试 */ }
+          emitStatus();
+          return;
+        }
+        markExtensionUnresponsive(why);
+      } catch { /* ignore */ } finally {
+        diagnosing = false;
+      }
+    }
+
     function sendCommand(cmd, params, timeoutMs) {
       return new Promise((resolve, reject) => {
         if ((state.status !== 'running' && state.status !== 'degraded') || !bridge) {
@@ -232,8 +254,8 @@ return {
         const ms = timeoutMs || 10000;
         const disposer = timer.timeout(() => {
           pending.delete(id);
-          reject(Object.assign(new Error('命令超时（扩展未在 ' + Math.round(ms / 1000) + 's 内应答）：' + EXT_HINT), { code: 'TIMEOUT' }));
-          if (cmd !== 'saveFile') markExtensionUnresponsive('命令 ' + cmd + ' 超时');
+          reject(Object.assign(new Error('命令超时（' + Math.round(ms / 1000) + 's 内无应答）：' + EXT_HINT), { code: 'TIMEOUT' }));
+          if (cmd !== 'saveFile' && cmd !== 'bridgePing') void diagnoseAndRecover('命令 ' + cmd + ' 超时');
         }, ms);
         pending.set(id, { resolve, reject, disposer });
         try {

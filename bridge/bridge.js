@@ -261,6 +261,12 @@ function handleHostMessage(msg) {
   if (msg && msg.cmd === 'saveFile' && typeof msg.id === 'number') {
     return handleSaveFile(msg);
   }
+  // 本地回环探针：不经扩展，用来区分"宿主↔桥链路坏了"和"扩展不应答"——
+  // 超时时如果连它都不回，就是桥/stdio 链路的问题（重启桥即可自愈）。
+  if (msg && msg.cmd === 'bridgePing' && typeof msg.id === 'number') {
+    emit({ type: 'ok', id: msg.id, result: { pong: true, at: Date.now() } });
+    return;
+  }
   if (msg && typeof msg.id === 'number' && typeof msg.cmd === 'string') {
     if (cmdQueue.length >= QUEUE_LIMIT) {
       emit({ type: 'err', id: msg.id, error: { code: 'QUEUE_FULL' } });
