@@ -93,22 +93,34 @@ export default {
 
     // ---------------- 桥生命周期 ----------------
     async function startBridge() {
+      // 旧句柄还挂着：先摘掉并终止。否则旧桥迟到的退出回调会把新桥刚设好的 running
+      // 覆盖成 error（stopBridge 后立刻 startBridge 的竞态，实测停桥 0.6s/3s 后再启
+      // 都能复现），而且句柄被覆盖后没人再能停掉旧进程 → 孤儿桥。
+      const prev = bridge;
+      if (prev) {
+        bridge = null;
+        try { prev.stdin.write(JSON.stringify({ cmd: 'shutdown' }) + '\n'); } catch { /* ignore */ }
+        timer.timeout(() => { try { prev.terminate(); } catch { /* ignore */ } }, 300);
+      }
       bridgeToken = genToken();
       bridgeStatus = 'starting';
       bridgeLastError = '';
+      outBuf = '';
       // cwd is mandatory: DSH validates spec.cwd unconditionally
       // (targetEnvironment -> validateNoNullByte), so an omitted cwd throws a
       // synchronous TypeError that used to wedge this state machine in
       // 'starting' forever. The bridge runs from inline `-e` code, so the
       // server's own working directory is a safe anchor.
       const cwd = (typeof process !== 'undefined' && process.cwd) ? process.cwd() : '.';
+      let handle;
       try {
-        bridge = subprocess.spawn({
+        handle = subprocess.spawn({
           argv: ['node', '-e', BRIDGE_CODE],
           cwd,
           stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'inherit' },
           graceMs: 1000,
         });
+        bridge = handle;
       } catch (e) {
         // A synchronous spawn failure must not leave 'starting' without a live
         // handle: record it and leave the state restartable.
@@ -118,7 +130,10 @@ export default {
         emitStatus();
         throw Object.assign(new Error(bridgeLastError), { code: 'BRIDGE_SPAWN_FAILED' });
       }
-      bridge.stdout.on('data', (c) => {
+      // 后续回调全部绑定 handle，并用 bridge !== handle 判断"自己还是不是当前桥"：
+      // 旧桥迟到的 stdout / 退出事件绝不能改写新桥状态，更不能 reject 新桥的命令。
+      handle.stdout.on('data', (c) => {
+        if (bridge !== handle) return;
         outBuf += c.toString();
         let i;
         while ((i = outBuf.indexOf('\n')) >= 0) {
@@ -130,7 +145,9 @@ export default {
           onBridgeMsg(msg);
         }
       });
-      bridge.done.then((outcome) => {
+      handle.done.then((outcome) => {
+        if (bridge !== handle) return; // 旧桥迟到退出：不动新桥
+        bridge = null;
         if (bridgeStatus !== 'stopped') {
           bridgeStatus = 'error';
           bridgeLastError = '桥退出 code=' + outcome.exitCode;
@@ -138,32 +155,36 @@ export default {
         rejectAll('BRIDGE_DIED', '桥已退出');
         emitStatus();
       }).catch((e) => {
+        if (bridge !== handle) return;
+        bridge = null;
         bridgeStatus = 'error';
         bridgeLastError = '桥 spawn 失败: ' + String((e && e.message) || e);
         rejectAll('BRIDGE_SPAWN_FAILED', bridgeLastError);
         emitStatus();
       });
       try {
-        bridge.stdin.write(JSON.stringify({ id: 0, cmd: 'config', token: bridgeToken }) + '\n');
+        handle.stdin.write(JSON.stringify({ id: 0, cmd: 'config', token: bridgeToken }) + '\n');
       } catch (e) {
         bridgeLastError = '写桥配置失败: ' + String(e);
       }
       timer.timeout(() => {
+        if (bridge !== handle) return;
         if (bridgeStatus === 'starting') {
           bridgeStatus = 'error';
           bridgeLastError = '桥启动超时（未收到 ready）';
-          try { bridge.terminate(); } catch { /* ignore */ }
+          try { handle.terminate(); } catch { /* ignore */ }
           emitStatus();
         }
       }, 5000);
     }
 
     function stopBridge() {
-      if (bridge) {
-        try { bridge.stdin.write(JSON.stringify({ cmd: 'shutdown' }) + '\n'); } catch { /* ignore */ }
-        timer.timeout(() => { try { bridge.terminate(); } catch { /* ignore */ } }, 1000);
-      }
+      const prev = bridge;
       bridge = null;
+      if (prev) {
+        try { prev.stdin.write(JSON.stringify({ cmd: 'shutdown' }) + '\n'); } catch { /* ignore */ }
+        timer.timeout(() => { try { prev.terminate(); } catch { /* ignore */ } }, 1000);
+      }
       rejectAll('STOPPED', '浏览器已停止');
       bridgeStatus = 'stopped';
       bridgePort = null;
