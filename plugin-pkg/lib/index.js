@@ -229,7 +229,7 @@ export default {
           // 全局 url/title 事件不再直接写入（各会话状态由命令返回同步），但它是
           // 「扩展仍 attach 且存活」的证据：据此从 degraded 自愈。否则 degraded 是
           // 单向死状态 —— 除桥重启外没有任何路径把它变回 running。
-          if (bridgeStatus === 'degraded') { bridgeStatus = 'running'; emitStatus(); }
+          healIfDegraded();
           break;
         case 'ok': {
           const p = pending.get(msg.id);
@@ -239,7 +239,7 @@ export default {
             p.resolve(msg.result || {});
           }
           // 命令被扩展成功执行 = 扩展在线：同样视为 degraded 自愈证据
-          if (bridgeStatus === 'degraded') { bridgeStatus = 'running'; emitStatus(); }
+          healIfDegraded();
           break;
         }
         case 'err': {
@@ -266,6 +266,15 @@ export default {
     // cmd.tabId：命令目标标签（会话 activeTabId）。degraded 也放行 —— ensureRunning
     // 要靠一条 ping 探活把这个状态救回来，否则只能空等超时。
     const EXT_HINT = '请在 Edge 打开 dsh-bib 扩展 popup 点一次「连接」，或在 edge://extensions 重新加载扩展';
+
+    // degraded → running：收到扩展的任何存活证据（状态上报 / 任意命令成功 / ping 成功）
+    // 就自愈，并清掉上一轮的离线提示（否则 UI 会一直挂着"扩展无响应"的旧错误）。
+    function healIfDegraded() {
+      if (bridgeStatus !== 'degraded') return;
+      bridgeStatus = 'running';
+      bridgeLastError = '';
+      emitStatus();
+    }
 
     // 扩展没在超时内应答：标成 degraded 并留下可操作原因。否则每个 browser_* 调用
     // 都要各自白等 5-30s 才失败，模型和人都会被拖住（这正是"打不开"的体感来源）。
@@ -341,7 +350,11 @@ export default {
         }
         p.tabId = s.activeTabId;
       }
-      return sendCommand(cmd, p, timeoutMs);
+      const r = await sendCommand(cmd, p, timeoutMs);
+      // 命令成功 = 这条会话已经恢复：清掉上一轮失败留下的 st.lastError，
+      // 否则 UI 会一直挂着"标签已关闭/扩展已 detach"的旧错误（stopBridge 之外无人清）。
+      if (s.lastError) s.lastError = '';
+      return r;
     }
 
     // ---------------- 树契约 ----------------
@@ -478,7 +491,7 @@ export default {
       if (bridgeStatus === 'degraded') {
         try {
           await sendCommand('ping', {}, 3000);
-          if (bridgeStatus !== 'running') { bridgeStatus = 'running'; emitStatus(); }
+          healIfDegraded();
           return;
         } catch (e) {
           throw Object.assign(new Error('扩展已离线：请在 Edge 打开 dsh-bib 扩展 popup 点一次「连接」，或让模型 browser_open 重新绑定'), { code: 'EXTENSION_OFFLINE' });
@@ -832,28 +845,55 @@ export default {
       }
       const st = sessionState(sessionId);
       const fullPage = !!args.fullPage;
+      // 显式文件名带 .png/.jpg 后缀时以它为准（默认视口 JPEG、整页强制 PNG）：
+      // 否则会写出「.png 后缀里装 JPEG 字节」，read_image 会因格式不符直接拒读。
+      const extOf = (p) => {
+        if (!p || /[\\/]$/.test(p)) return null; // 以分隔符结尾 = 目录，走自动命名
+        const m = /\.[A-Za-z0-9]+$/.exec(p);
+        return m ? m[0].toLowerCase() : null;
+      };
+      const wantExt = extOf(args.saveTo);
+      const wantFormat = wantExt === '.png' ? 'png' : 'jpeg';
       let shot = null;
       // 只有"看当前画面"才复用帧缓存；整页/落盘必须现拍（缓存里是视口 JPEG）
       if (!fullPage && !args.saveTo && st.frame) {
         shot = { data: st.frame.data, width: st.frame.width, height: st.frame.height, seq: st.frame.seq, format: 'jpeg' };
       } else {
         try {
-          const r = await sessionCommand(sessionId, 'screenshot',
-            fullPage ? { fullPage: true, format: 'png' } : {}, fullPage ? 30000 : 10000);
+          const r = await sessionCommand(sessionId, 'screenshot', {
+            ...(fullPage ? { fullPage: true } : {}),
+            ...(wantFormat === 'png' ? { format: 'png' } : {}),
+          }, fullPage ? 30000 : 10000);
           if (r && r.data) shot = r;
         } catch (e) {
           return errResult('NO_FRAME', '扩展截图失败：' + String((e && e.message) || e) + ' code=' + (e && e.code));
         }
       }
       if (!shot) return errResult('NO_FRAME', '扩展亦无帧');
+      // 真实格式以扩展回报为准（整页强制 PNG，可能与请求后缀不一致）
       const format = shot.format === 'png' ? 'png' : 'jpeg';
       const base = { width: shot.width || 0, height: shot.height || 0, fullPage: shot.fullPage === true, format };
       // ① saveTo：落盘（桥的本地命令；ctx.fs 只有文本原语，二进制图写不了）
       let saved = null;
+      let savedPathFallback = args.saveTo || '';
       if (args.saveTo) {
+        // 落盘路径与字节格式对齐：扩展回退/整页产出和请求后缀不一致时改后缀，
+        // 保证落盘文件一定能被 read_image 认出来（显式路径没后缀则补上）。
+        let savePath = String(args.saveTo);
+        if (!/[\\/]$/.test(savePath)) {
+          const cur = extOf(savePath);
+          const okExt = cur === '.png' ? format === 'png'
+            : (cur === '.jpg' || cur === '.jpeg') ? format === 'jpeg'
+              : false;
+          if (!okExt) {
+            const want = format === 'png' ? '.png' : '.jpg';
+            savePath = cur ? savePath.slice(0, -cur.length) + want : savePath + want;
+          }
+        }
+        savedPathFallback = savePath;
         const name = 'bib-' + new Date().toISOString().replace(/[:.]/g, '-') + '.' + (format === 'png' ? 'png' : 'jpg');
         try {
-          saved = await sendCommand('saveFile', { path: args.saveTo, name, data: shot.data }, 30000);
+          saved = await sendCommand('saveFile', { path: savePath, name, data: shot.data }, 30000);
         } catch (e) {
           return errResult((e && e.code) || 'SAVE_FAILED', '保存失败：' + String((e && e.message) || e));
         }
@@ -882,7 +922,7 @@ export default {
         ok: true,
         result: {
           ...base,
-          ...(saved ? { path: (saved && saved.path) || args.saveTo, bytes: (saved && saved.bytes) || 0 } : {}),
+          ...(saved ? { path: (saved && saved.path) || savedPathFallback, bytes: (saved && saved.bytes) || 0 } : {}),
           ...(image ? { image } : {}),
           ...(inlineError ? { inlineError } : {}),
         },
@@ -1057,7 +1097,7 @@ export default {
                 title: st ? st.title : '',
                 hasFrame: st ? !!st.frame : false,
                 seq: st ? st.lastSeq : -1,
-                code: bridgeStatus === 'running' ? bridgeCode : null,
+                code: (bridgeStatus === 'running' || bridgeStatus === 'degraded') ? bridgeCode : null,
                 tabs: st ? st.tabs : [],
                 activeTab: st ? st.activeTabId : null,
                 lastError: st ? st.lastError : bridgeLastError,
@@ -1191,7 +1231,10 @@ export default {
             return json(403, { error: { code: 'BAD_ORIGIN' } });
           }
           const m = bridgeCode && bridgeCode.match(/^127\.0\.0\.1:(\d+)#([0-9a-fA-F]+)$/);
-          if (bridgeStatus !== 'running' || !m) {
+          // degraded = 扩展掉线但桥仍存活：此时 port/token 依然有效，必须继续对外暴露。
+          // 旧实现只在 running 时暴露，于是「桥在跑、扩展却被告知不可用」形成死锁 ——
+          // 扩展永远无法自动发现回来，只能人工点「连接」或重启桥才能自愈。
+          if ((bridgeStatus !== 'running' && bridgeStatus !== 'degraded') || !m) {
             return json(200, { available: false });
           }
           json(200, { available: true, port: Number(m[1]), token: m[2] });
